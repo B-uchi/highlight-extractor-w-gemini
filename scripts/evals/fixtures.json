@@ -1,0 +1,14 @@
+[
+  {
+    "id": "sample-generic-1",
+    "videoPath": "tmp/smoke-fixtures/short-6min.mp4",
+    "expectedMinHighlights": 1,
+    "category": "generic"
+  },
+  {
+    "id": "sample-generic-2",
+    "videoPath": "tmp/smoke-fixtures/long-11min.mp4",
+    "expectedMinHighlights": 1,
+    "category": "generic"
+  }
+]

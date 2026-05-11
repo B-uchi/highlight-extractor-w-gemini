@@ -2,6 +2,7 @@ import { mkdir, readdir } from "node:fs/promises";
 import path from "node:path";
 
 import { ffmpeg, getMediaDurationSec, runCommand } from "@/lib/ffmpeg";
+import { appConfig } from "@/lib/config";
 
 export interface VideoChunk {
   path: string;
@@ -9,12 +10,9 @@ export interface VideoChunk {
   durationSec: number;
 }
 
-const LONG_VIDEO_THRESHOLD_SEC = 1_200;
-const CHUNK_DURATION_SEC = 900;
-
 export async function chunkVideo(inputVideoPath: string, outputDir: string): Promise<VideoChunk[]> {
   const totalDurationSec = await getMediaDurationSec(inputVideoPath);
-  if (totalDurationSec <= LONG_VIDEO_THRESHOLD_SEC) {
+  if (totalDurationSec <= appConfig.pipeline.videoLongThresholdSec) {
     return [
       {
         path: inputVideoPath,
@@ -31,7 +29,7 @@ export async function chunkVideo(inputVideoPath: string, outputDir: string): Pro
   const command = ffmpeg(inputVideoPath)
     .outputOptions([
       "-f segment",
-      `-segment_time ${CHUNK_DURATION_SEC}`,
+      `-segment_time ${appConfig.pipeline.videoChunkDurationSec}`,
       "-reset_timestamps 1",
       "-c copy",
       "-movflags +faststart",
@@ -41,7 +39,7 @@ export async function chunkVideo(inputVideoPath: string, outputDir: string): Pro
   await runCommand(command);
 
   const files = (await readdir(chunksDir))
-    .filter((file) => file.endsWith(".mp4"))
+    .filter((file) => /^video-\d{3}\.mp4$/i.test(file))
     .sort((a, b) => a.localeCompare(b));
 
   let runningStart = 0;

@@ -1,6 +1,12 @@
+import { eq } from "drizzle-orm";
+
+import { getDb, isDatabaseEnabled } from "@/lib/db";
+import { jobsTable } from "@/lib/dbSchema";
+import { emitJobUpdate } from "@/lib/events";
 import { JobState } from "@/lib/types";
 
 const jobs = new Map<string, JobState>();
+const pendingPersistence = new Map<string, Promise<void>>();
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -11,6 +17,7 @@ export function createJob(
   inputPath: string,
   userPrompt?: string,
   effectivePrompt?: string,
+  category?: string,
 ): JobState {
   const createdAt = nowIso();
   const job: JobState = {
@@ -21,6 +28,7 @@ export function createJob(
     inputPath,
     userPrompt,
     effectivePrompt,
+    category,
     metrics: {
       startedAt: createdAt,
       ai: {
@@ -40,6 +48,8 @@ export function createJob(
     updatedAt: createdAt,
   };
   jobs.set(id, job);
+  emitJobUpdate(job);
+  trackPersistence(id, persistJob(job));
   return job;
 }
 
@@ -59,6 +69,8 @@ export function updateJob(id: string, patch: Partial<JobState>): JobState {
     updatedAt: nowIso(),
   };
   jobs.set(id, next);
+  emitJobUpdate(next);
+  trackPersistence(id, persistJob(next));
   return next;
 }
 
@@ -70,4 +82,64 @@ export function setJobError(id: string, error: unknown): JobState {
     message: "Job failed",
     error: message,
   });
+}
+
+async function persistJob(job: JobState): Promise<void> {
+  if (!isDatabaseEnabled()) {
+    return;
+  }
+
+  const db = getDb();
+  const createdAt = new Date(job.createdAt);
+  const updatedAt = new Date(job.updatedAt);
+
+  await db
+    .insert(jobsTable)
+    .values({
+      id: job.id,
+      stage: job.stage,
+      payload: job as unknown as Record<string, unknown>,
+      createdAt,
+      updatedAt,
+    })
+    .onConflictDoUpdate({
+      target: jobsTable.id,
+      set: {
+        stage: job.stage,
+        payload: job as unknown as Record<string, unknown>,
+        updatedAt,
+      },
+    });
+}
+
+function trackPersistence(id: string, promise: Promise<void>): void {
+  pendingPersistence.set(id, promise);
+  void promise.finally(() => {
+    const current = pendingPersistence.get(id);
+    if (current === promise) {
+      pendingPersistence.delete(id);
+    }
+  });
+}
+
+export async function waitForJobPersistence(id: string): Promise<void> {
+  const pending = pendingPersistence.get(id);
+  if (pending) {
+    await pending;
+  }
+}
+
+export async function hydrateJobFromStore(id: string): Promise<JobState | undefined> {
+  if (!isDatabaseEnabled()) {
+    return jobs.get(id);
+  }
+  const db = getDb();
+  const result = await db.select().from(jobsTable).where(eq(jobsTable.id, id)).limit(1);
+  const row = result[0];
+  if (!row) {
+    return undefined;
+  }
+  const job = row.payload as JobState;
+  jobs.set(id, job);
+  return job;
 }

@@ -1,9 +1,18 @@
+import path from "node:path";
+
 import { Type } from "@google/genai";
 
 import { isMockAiMode } from "@/lib/aiMode";
+import { getCategoryPack } from "@/lib/categories/packs";
+import { detectVideoCategory } from "@/lib/categories/router";
+import { VideoCategory } from "@/lib/categories/types";
+import { appConfig } from "@/lib/config";
+import { mapWithConcurrency, withRetry } from "@/lib/concurrency";
 import { getGeminiClient, uploadGeminiVideoAndWait } from "@/lib/gemini";
+import { buildCandidateWindows } from "@/lib/pipeline/candidateWindows";
 import { VideoChunk } from "@/lib/pipeline/chunkVideo";
-import { Highlight, TranscriptSegment } from "@/lib/types";
+import { createVisionProxyVideo } from "@/lib/pipeline/proxy";
+import { CandidateWindow, Highlight, TranscriptSegment } from "@/lib/types";
 
 export const DEFAULT_HIGHLIGHT_PROMPT =
   "Find every distinct moment in this video that is highlight-worthy: emotionally strong, surprising, informative, funny, dramatic, or visually engaging. Prefer 20-90 second windows.";
@@ -18,6 +27,8 @@ interface VisualUsage {
 export interface VisualHighlightsResult {
   highlights: Highlight[];
   effectivePrompt: string;
+  category: VideoCategory;
+  candidates: CandidateWindow[];
   usage: VisualUsage;
 }
 
@@ -50,7 +61,24 @@ function dedupeOverlaps(highlights: Highlight[]): Highlight[] {
   return kept.sort((a, b) => a.startSec - b.startSec);
 }
 
+function rescaleScore(rawScore: number | undefined, maxObservedScore: number): number {
+  const value = Number.isFinite(rawScore) ? Number(rawScore) : 70;
+  // Models sometimes emit 0-1, 0-10, or 0-100. Pick a multiplier from the batch max.
+  let multiplier = 1;
+  if (maxObservedScore > 0 && maxObservedScore <= 1.0001) {
+    multiplier = 100;
+  } else if (maxObservedScore > 1 && maxObservedScore <= 10.0001) {
+    multiplier = 10;
+  }
+  return clamp(Math.round(value * multiplier), 0, 100);
+}
+
 function normalizeHighlights(highlights: Highlight[], maxDurationSec: number): Highlight[] {
+  const observedMaxScore = highlights.reduce((max, item) => {
+    const candidate = Number.isFinite(item.score) ? Number(item.score) : 0;
+    return candidate > max ? candidate : max;
+  }, 0);
+
   const normalized = highlights
     .map((item) => {
       const startSec = clamp(item.startSec, 0, maxDurationSec);
@@ -64,7 +92,15 @@ function normalizeHighlights(highlights: Highlight[], maxDurationSec: number): H
         endSec,
         title: item.title?.trim() || "Highlight moment",
         reason: item.reason?.trim() || "High-engagement moment detected.",
-        score: clamp(item.score ?? 70, 0, 100),
+        score: rescaleScore(item.score, observedMaxScore),
+        confidence: clamp(item.confidence ?? 0.7, 0, 1),
+        eventType: item.eventType ?? "highlight",
+        evidence: item.evidence ?? ["visual-model"],
+        category: item.category ?? "generic",
+        tags: item.tags ?? [],
+        transcriptQuote: item.transcriptQuote,
+        keyFrameSec: item.keyFrameSec,
+        audioPeakDb: item.audioPeakDb,
       };
     })
     .filter((item) => Number.isFinite(item.startSec) && Number.isFinite(item.endSec) && item.endSec > item.startSec);
@@ -107,6 +143,14 @@ function parseGeminiHighlights(raw: string | undefined): Highlight[] {
         title: String(item.title ?? "Highlight"),
         reason: String(item.reason ?? "Highlight-worthy moment"),
         score: Number(item.score ?? 75),
+        eventType: String(item.eventType ?? "highlight"),
+        confidence: Number(item.confidence ?? 0.7),
+        evidence: Array.isArray(item.evidence) ? item.evidence.map((entry) => String(entry)) : ["gemini"],
+        category: String(item.category ?? "generic"),
+        tags: Array.isArray(item.tags) ? item.tags.map((entry) => String(entry)) : [],
+        transcriptQuote: item.transcriptQuote ? String(item.transcriptQuote) : undefined,
+        keyFrameSec: typeof item.keyFrameSec === "number" ? item.keyFrameSec : undefined,
+        audioPeakDb: typeof item.audioPeakDb === "number" ? item.audioPeakDb : undefined,
       }));
   } catch {
     return [];
@@ -118,9 +162,24 @@ export async function rankVisualHighlights(params: {
   videoChunks: VideoChunk[];
   transcriptSegments: TranscriptSegment[];
   userPrompt?: string;
+  previewVideoPath?: string;
+  initialCategory?: VideoCategory | string;
   maxDurationSec: number;
 }): Promise<VisualHighlightsResult> {
-  const effectivePrompt = params.userPrompt?.trim() || DEFAULT_HIGHLIGHT_PROMPT;
+  const detectedCategory =
+    params.initialCategory && params.initialCategory !== "auto"
+      ? (params.initialCategory as VideoCategory)
+      : await detectVideoCategory({
+          previewVideoPath: params.previewVideoPath ?? params.inputVideoPath,
+          transcriptSegments: params.transcriptSegments,
+        });
+  const pack = getCategoryPack(detectedCategory);
+  const effectivePrompt = params.userPrompt?.trim() || `${DEFAULT_HIGHLIGHT_PROMPT}\n${pack.prompt}`;
+  const candidates = buildCandidateWindows({
+    transcriptSegments: params.transcriptSegments,
+    maxDurationSec: params.maxDurationSec,
+    desiredWindowSec: Math.max(pack.minDurationSec, Math.min(pack.maxDurationSec, 35)),
+  });
 
   if (isMockAiMode()) {
     const fallback = normalizeHighlights(
@@ -138,6 +197,8 @@ export async function rankVisualHighlights(params: {
           title: "Mock visual highlight 2",
           reason: "Strong visual shift and meaningful spoken moment.",
           score: 79,
+          eventType: "highlight",
+          category: detectedCategory,
         },
       ],
       params.maxDurationSec,
@@ -152,6 +213,8 @@ export async function rankVisualHighlights(params: {
         totalTokens: 0,
         videoSeconds: params.videoChunks.reduce((sum, chunk) => sum + chunk.durationSec, 0),
       },
+      category: detectedCategory,
+      candidates,
     };
   }
 
@@ -164,83 +227,119 @@ export async function rankVisualHighlights(params: {
     videoSeconds: 0,
   };
 
-  for (const chunk of params.videoChunks) {
-    usage.videoSeconds += chunk.durationSec;
+  const chunkHighlights = await mapWithConcurrency(
+    params.videoChunks,
+    appConfig.pipeline.geminiConcurrency,
+    async (chunk) => {
+      usage.videoSeconds += chunk.durationSec;
 
-    try {
-      const uploaded = await uploadGeminiVideoAndWait(chunk.path);
-      const transcriptWindow = buildChunkTranscript(params.transcriptSegments, chunk);
+      try {
+        const proxyDir = path.join(path.dirname(chunk.path), "..", "chunk-proxies");
+        const proxyPath = await createVisionProxyVideo(chunk.path, proxyDir);
+        const uploaded = await uploadGeminiVideoAndWait(proxyPath);
+        const transcriptWindow = buildChunkTranscript(params.transcriptSegments, chunk);
 
-      const response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: [
-          {
-            role: "user",
-            parts: [
-              {
-                text: [
-                  "You are a highlight detection assistant.",
-                  "Given this video chunk and transcript, return every distinct highlight moment you can find.",
-                  "Return timestamps relative to THIS chunk (chunk starts at 0).",
-                  "Prefer 20-90 second windows when possible.",
-                  `Highlight criteria: ${effectivePrompt}`,
-                  "",
-                  "Transcript for this chunk:",
-                  transcriptWindow,
-                ].join("\n"),
-              },
-              {
-                fileData: {
-                  fileUri: uploaded.uri,
-                  mimeType: uploaded.mimeType ?? "video/mp4",
+        const response = await withRetry(
+          () =>
+            ai.models.generateContent({
+              model: "gemini-2.5-flash",
+              contents: [
+                {
+                  role: "user",
+                  parts: [
+                    {
+                      text: [
+                        "You are a highlight detection assistant.",
+                        "Given this video chunk and transcript, return every distinct highlight moment you can find.",
+                        "Return timestamps relative to THIS chunk (chunk starts at 0).",
+                        "Prefer 20-90 second windows when possible.",
+                        "Score must be an integer between 0 and 100 (not 0-10, not 0-1).",
+                        "Confidence must be a decimal between 0 and 1.",
+                        `Category: ${detectedCategory}`,
+                        `Allowed event types: ${pack.allowedEventTypes.join(", ")}`,
+                        `Highlight criteria: ${effectivePrompt}`,
+                        "",
+                        "Candidate windows to prioritize (seconds):",
+                        candidates.map((window) => `${window.startSec.toFixed(2)}-${window.endSec.toFixed(2)}`).join(", "),
+                        "",
+                        "Transcript for this chunk:",
+                        transcriptWindow,
+                      ].join("\n"),
+                    },
+                    {
+                      fileData: {
+                        fileUri: uploaded.uri,
+                        mimeType: uploaded.mimeType ?? "video/mp4",
+                      },
+                    },
+                  ],
+                },
+              ],
+              config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    required: ["startSec", "endSec", "title", "reason", "score", "eventType", "confidence"],
+                    properties: {
+                      startSec: { type: Type.NUMBER },
+                      endSec: { type: Type.NUMBER },
+                      title: { type: Type.STRING },
+                      reason: { type: Type.STRING },
+                      score: { type: Type.NUMBER },
+                      eventType: { type: Type.STRING },
+                      confidence: { type: Type.NUMBER },
+                      evidence: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      category: { type: Type.STRING },
+                      tags: { type: Type.ARRAY, items: { type: Type.STRING } },
+                      transcriptQuote: { type: Type.STRING },
+                      keyFrameSec: { type: Type.NUMBER },
+                      audioPeakDb: { type: Type.NUMBER },
+                    },
+                  },
                 },
               },
-            ],
-          },
-        ],
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              required: ["startSec", "endSec", "title", "reason", "score"],
-              properties: {
-                startSec: { type: Type.NUMBER },
-                endSec: { type: Type.NUMBER },
-                title: { type: Type.STRING },
-                reason: { type: Type.STRING },
-                score: { type: Type.NUMBER },
-              },
-            },
-          },
-        },
-      });
+            }),
+          { retries: 2, baseDelayMs: 800 },
+        );
 
-      usage.inputTokens += response.usageMetadata?.promptTokenCount ?? 0;
-      usage.outputTokens += response.usageMetadata?.candidatesTokenCount ?? 0;
-      usage.totalTokens += response.usageMetadata?.totalTokenCount ?? 0;
+        usage.inputTokens += response.usageMetadata?.promptTokenCount ?? 0;
+        usage.outputTokens += response.usageMetadata?.candidatesTokenCount ?? 0;
+        usage.totalTokens += response.usageMetadata?.totalTokenCount ?? 0;
 
-      const parsed = parseGeminiHighlights(response.text).map((item) => ({
-        ...item,
-        startSec: item.startSec + chunk.startSec,
-        endSec: item.endSec + chunk.startSec,
-      }));
+        const parsed = parseGeminiHighlights(response.text).map((item) => ({
+          ...item,
+          startSec: item.startSec + chunk.startSec,
+          endSec: item.endSec + chunk.startSec,
+          category: detectedCategory,
+        }));
 
-      allHighlights.push(...parsed);
-
-      if (uploaded.name) {
-        await ai.files.delete({ name: uploaded.name }).catch(() => undefined);
+        if (uploaded.name) {
+          await ai.files.delete({ name: uploaded.name }).catch(() => undefined);
+        }
+        return parsed;
+      } catch (error) {
+        console.error(`Gemini highlight extraction failed for chunk ${chunk.path}`, error);
+        return [];
       }
-    } catch (error) {
-      console.error(`Gemini highlight extraction failed for chunk ${chunk.path}`, error);
-      // Continue processing remaining chunks; do not fail whole job.
-    }
-  }
+    },
+  );
+  allHighlights.push(...chunkHighlights.flat());
+
+  const normalized = normalizeHighlights(allHighlights, params.maxDurationSec);
+
+  // Final pass: enforce diversity and global ranking.
+  const finalHighlights = [...normalized]
+    .sort((a, b) => (b.score + (b.confidence ?? 0) * 100) - (a.score + (a.confidence ?? 0) * 100))
+    .slice(0, appConfig.pipeline.maxHighlightsFinal)
+    .sort((a, b) => a.startSec - b.startSec);
 
   return {
-    highlights: normalizeHighlights(allHighlights, params.maxDurationSec),
+    highlights: finalHighlights,
     effectivePrompt,
+    category: detectedCategory,
+    candidates,
     usage,
   };
 }

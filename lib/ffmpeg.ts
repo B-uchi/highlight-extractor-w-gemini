@@ -47,6 +47,42 @@ export function runCommand(command: ffmpeg.FfmpegCommand): Promise<void> {
   });
 }
 
+/**
+ * Run FFmpeg CLI with a hard wall-clock timeout (fluent-ffmpeg has no built-in timeout;
+ * concat jobs can otherwise hang indefinitely on some bad inputs).
+ */
+export function runFfmpegArgs(args: string[], timeoutMs: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(resolvedFfmpegPath, args, {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      stderr += chunk.toString();
+    });
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(
+        new Error(
+          `FFmpeg timed out after ${timeoutMs}ms. ${stderr.trim().slice(-2_000) || "(no stderr)"}`,
+        ),
+      );
+    }, timeoutMs);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      reject(new Error(`FFmpeg exited with code ${code}: ${stderr.trim().slice(-4_000) || "(no stderr)"}`));
+    });
+  });
+}
+
 export function getMediaDurationSec(filePath: string): Promise<number> {
   return new Promise((resolve, reject) => {
     const child = spawn(resolvedFfmpegPath, ["-i", filePath]);

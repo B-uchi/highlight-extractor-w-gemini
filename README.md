@@ -1,12 +1,13 @@
-# Video Highlights Spike
+# Video Highlights
 
-Single-app Next.js spike for:
+General-purpose, multi-category highlight extraction pipeline with:
 
-1. Upload video
-2. Extract audio with FFmpeg
-3. Chunk + transcribe with Whisper
-4. Rank one highlight with GPT-4o
-5. Cut clip with FFmpeg
+- Next.js API + UI
+- FFmpeg audio/video chunking and clipping
+- Whisper transcription
+- Gemini multi-highlight ranking
+- Candidate pre-filtering, category packs, and two-pass ranking
+- Optional queue/worker mode, Postgres persistence, object storage, and Python CV worker
 
 ## Setup
 
@@ -15,11 +16,19 @@ npm install
 cp .env.example .env.local
 ```
 
-Set:
+Set required keys:
 
 ```bash
 OPENAI_API_KEY=...
+GEMINI_API_KEY=...
 ```
+
+Optional infra:
+
+- `USE_QUEUE=true` + `REDIS_URL=...` to use BullMQ worker mode
+- `USE_DATABASE_JOBS=true` + `DATABASE_URL=...` to persist jobs in Postgres
+- `STORAGE_MODE=s3` + storage credentials to publish clip URLs from object storage
+- `ENABLE_CV_WORKER=true` + `CV_WORKER_URL=http://localhost:8000` to enable scene/CV worker hooks
 
 ## Run
 
@@ -27,21 +36,29 @@ OPENAI_API_KEY=...
 npm run dev
 ```
 
-Open `http://localhost:3000`, upload a video, and poll status in the UI.
+Optional queue worker:
+
+```bash
+npm run worker
+```
+
+Open [http://localhost:3000](http://localhost:3000), upload a video, and watch live job updates over SSE.
+
+## Evaluation
+
+```bash
+npm run eval
+```
+
+The eval harness runs fixtures from `scripts/evals/fixtures.json` and reports highlight count, latency, and token usage.
 
 ## Smoke test
-
-This repository includes a local smoke test for short and long synthetic videos.
 
 ```bash
 npm run smoke:test
 ```
 
-Notes:
-
-- It runs in `MOCK_AI=true` mode (no OpenAI credentials required).
-- It verifies pipeline completion and clip generation for ~6 min and ~11 min videos.
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+It runs in `MOCK_AI=true` mode and validates end-to-end clip generation.
 
 ## Getting Started
 
@@ -72,7 +89,7 @@ To learn more about Next.js, take a look at the following resources:
 
 You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
 
-## Deploy on Vercel
+## Deploy
 
 The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
 

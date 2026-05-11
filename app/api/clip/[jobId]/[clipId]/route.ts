@@ -19,6 +19,9 @@ export async function GET(
   if (!job || !clip?.path) {
     return NextResponse.json({ error: "Clip not available for this job." }, { status: 404 });
   }
+  if (clip.url.startsWith("http://") || clip.url.startsWith("https://")) {
+    return NextResponse.redirect(clip.url);
+  }
 
   try {
     await access(clip.path);

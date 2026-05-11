@@ -14,6 +14,14 @@ export interface Highlight {
   title: string;
   reason: string;
   score: number;
+  eventType?: string;
+  confidence?: number;
+  evidence?: string[];
+  category?: string;
+  tags?: string[];
+  transcriptQuote?: string;
+  keyFrameSec?: number;
+  audioPeakDb?: number;
 }
 
 export interface GeneratedClip {
@@ -24,6 +32,8 @@ export interface GeneratedClip {
   endSec: number;
   title: string;
   score: number;
+  eventType?: string;
+  category?: string;
 }
 
 export interface TranscriptSegment {
@@ -59,6 +69,15 @@ export interface JobMetrics {
   finishedAt?: string;
   durationMs?: number;
   ai: AiUsageMetrics;
+  costUsdEstimate?: number;
+}
+
+export interface CandidateWindow {
+  startSec: number;
+  endSec: number;
+  transcriptScore: number;
+  audioScore: number;
+  reasons: string[];
 }
 
 export interface JobState {
@@ -68,10 +87,14 @@ export interface JobState {
   message: string;
   error?: string;
   inputPath: string;
+  inputHash?: string;
+  storageInputKey?: string;
   userPrompt?: string;
   effectivePrompt?: string;
+  category?: string;
   transcriptPath?: string;
   highlightsPath?: string;
+  candidatesPath?: string;
   highlights?: Highlight[];
   clips?: GeneratedClip[];
   metrics: JobMetrics;

@@ -53,6 +53,8 @@ export async function cutClipsForHighlights(
       endSec: highlight.endSec,
       title: highlight.title,
       score: highlight.score,
+      eventType: highlight.eventType,
+      category: highlight.category,
     });
   }
 

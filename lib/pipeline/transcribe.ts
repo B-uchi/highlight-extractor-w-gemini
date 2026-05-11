@@ -1,6 +1,8 @@
 import { createReadStream } from "node:fs";
 
 import { isMockAiMode } from "@/lib/aiMode";
+import { appConfig } from "@/lib/config";
+import { mapWithConcurrency } from "@/lib/concurrency";
 import { getOpenAIClient } from "@/lib/openai";
 import { TranscriptResult, TranscriptSegment } from "@/lib/types";
 import { AudioChunk } from "@/lib/pipeline/chunkAudio";
@@ -46,18 +48,21 @@ export async function transcribeChunks(chunks: AudioChunk[]): Promise<Transcript
   }
 
   const openai = getOpenAIClient();
-  const stitchedSegments: TranscriptSegment[] = [];
-  const fullTextParts: string[] = [];
-  let transcriptionSeconds = 0;
-
-  for (const chunk of chunks) {
+  const responses = await mapWithConcurrency(chunks, appConfig.pipeline.whisperConcurrency, async (chunk) => {
     const response = (await openai.audio.transcriptions.create({
       file: createReadStream(chunk.path),
       model: "whisper-1",
       response_format: "verbose_json",
       timestamp_granularities: ["segment"],
     })) as WhisperVerboseResponse;
+    return { chunk, response };
+  });
 
+  const stitchedSegments: TranscriptSegment[] = [];
+  const fullTextParts: string[] = [];
+  let transcriptionSeconds = 0;
+
+  for (const { chunk, response } of responses.sort((a, b) => a.chunk.startSec - b.chunk.startSec)) {
     if (response.text) {
       fullTextParts.push(response.text.trim());
     }
@@ -66,14 +71,9 @@ export async function transcribeChunks(chunks: AudioChunk[]): Promise<Transcript
     }
 
     for (const segment of response.segments ?? []) {
-      if (
-        typeof segment.start !== "number" ||
-        typeof segment.end !== "number" ||
-        !segment.text?.trim()
-      ) {
+      if (typeof segment.start !== "number" || typeof segment.end !== "number" || !segment.text?.trim()) {
         continue;
       }
-
       stitchedSegments.push({
         start: segment.start + chunk.startSec,
         end: segment.end + chunk.startSec,
