@@ -2,8 +2,9 @@ import { eq } from "drizzle-orm";
 
 import { getDb, isDatabaseEnabled } from "@/lib/db";
 import { jobsTable } from "@/lib/dbSchema";
+import { normalizeProcessingPresetsState } from "@/lib/defaultActions";
 import { emitJobUpdate } from "@/lib/events";
-import { JobState } from "@/lib/types";
+import type { JobState, PlayerFocusSpec, ProcessingPresetsState } from "@/lib/types";
 
 const jobs = new Map<string, JobState>();
 const pendingPersistence = new Map<string, Promise<void>>();
@@ -18,8 +19,12 @@ export function createJob(
   userPrompt?: string,
   effectivePrompt?: string,
   category?: string,
+  conversationId?: string,
+  playerFocus?: PlayerFocusSpec,
+  processingPresets?: ProcessingPresetsState | null,
 ): JobState {
   const createdAt = nowIso();
+  const presets = normalizeProcessingPresetsState(processingPresets ?? null);
   const job: JobState = {
     id,
     stage: "queued",
@@ -29,6 +34,9 @@ export function createJob(
     userPrompt,
     effectivePrompt,
     category,
+    conversationId,
+    playerFocus,
+    ...(presets ? { processingPresets: presets } : {}),
     metrics: {
       startedAt: createdAt,
       ai: {
@@ -70,17 +78,23 @@ export function updateJob(id: string, patch: Partial<JobState>): JobState {
   };
   jobs.set(id, next);
   emitJobUpdate(next);
+  void import("@/lib/agentTaskSync")
+    .then(({ syncAgentTasksFromJobState }) => syncAgentTasksFromJobState(next))
+    .catch(() => undefined);
   trackPersistence(id, persistJob(next));
   return next;
 }
 
 export function setJobError(id: string, error: unknown): JobState {
   const message = error instanceof Error ? error.message : String(error);
+  const current = jobs.get(id);
+  const failedAtStage = current?.stage && current.stage !== "error" ? current.stage : undefined;
   return updateJob(id, {
     stage: "error",
     progress: 100,
     message: "Job failed",
     error: message,
+    failedAtStage,
   });
 }
 

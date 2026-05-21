@@ -20,7 +20,7 @@ export async function GET(
       let closed = false;
       let lastUpdatedAt = "";
       let pollTimer: ReturnType<typeof setInterval> | null = null;
-      let unsubscribe = () => undefined;
+      let unsubscribe: () => void = () => {};
 
       const closeStream = () => {
         if (closed) {

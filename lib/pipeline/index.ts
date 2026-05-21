@@ -49,7 +49,9 @@ export async function runPipeline(jobId: string): Promise<void> {
     updateJob(jobId, { inputHash });
     const overrideCategory = (currentJob?.category ?? "auto").toString();
     const cacheDigest = createHash("sha256")
-      .update(`${overrideCategory}::${userPrompt ?? "__default__"}`)
+      .update(
+        `${overrideCategory}::${userPrompt ?? "__default__"}::${JSON.stringify(currentJob?.playerFocus ?? null)}::${JSON.stringify(currentJob?.processingPresets ?? null)}`,
+      )
       .digest("hex")
       .slice(0, 16);
     const cachePromptKey = `highlights-${cacheDigest}`;
@@ -132,6 +134,7 @@ export async function runPipeline(jobId: string): Promise<void> {
           previewVideoPath,
           initialCategory: currentJob?.category,
           maxDurationSec: videoDurationSec,
+          playerFocus: currentJob?.playerFocus,
         });
 
     if (!cachedRanking) {

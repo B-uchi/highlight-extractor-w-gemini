@@ -1,9 +1,17 @@
-import { createJob, setJobError, waitForJobPersistence } from "@/lib/jobs";
+import { parsePlayerFocusSpec } from "@/lib/playerFocus";
+import {
+  buildCombinedPrompt,
+  mergeUserPromptWithPresetBlock,
+  normalizeProcessingPresetsState,
+} from "@/lib/defaultActions";
+import { createJob, setJobError, updateJob, waitForJobPersistence } from "@/lib/jobs";
 import { runPipeline } from "@/lib/pipeline";
 import { enqueuePipelineJob, isQueueEnabled } from "@/lib/queue";
 import { saveInputVideo } from "@/lib/storage";
 import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
+
+import type { ProcessingPresetsState } from "@/lib/types";
 
 export const runtime = "nodejs";
 
@@ -33,7 +41,39 @@ export async function POST(request: Request) {
         ? categoryInput.trim()
         : undefined;
 
-    createJob(jobId, stored.path, userPrompt, undefined, category);
+    const playerFocusRaw = formData.get("playerFocus");
+    let playerFocus = undefined;
+    if (typeof playerFocusRaw === "string" && playerFocusRaw.trim()) {
+      try {
+        const parsed = JSON.parse(playerFocusRaw) as unknown;
+        playerFocus = parsePlayerFocusSpec(parsed) ?? undefined;
+      } catch {
+        return NextResponse.json({ error: "Invalid JSON in playerFocus field." }, { status: 400 });
+      }
+    }
+
+    let processingPresets: ProcessingPresetsState | null | undefined = undefined;
+    const processingPresetsRaw = formData.get("processingPresets");
+    if (typeof processingPresetsRaw === "string" && processingPresetsRaw.trim()) {
+      try {
+        const parsed = JSON.parse(processingPresetsRaw) as unknown;
+        processingPresets = normalizeProcessingPresetsState(parsed as ProcessingPresetsState) ?? null;
+      } catch {
+        return NextResponse.json({ error: "Invalid JSON in processingPresets field." }, { status: 400 });
+      }
+    }
+
+    const presetBlock =
+      processingPresets?.selectedIds?.length
+        ? buildCombinedPrompt(processingPresets.selectedIds, processingPresets.placeholders ?? null)
+        : "";
+
+    const mergedUserPrompt = mergeUserPromptWithPresetBlock(userPrompt, presetBlock || null);
+
+    createJob(jobId, stored.path, mergedUserPrompt, undefined, category, undefined, playerFocus, processingPresets);
+    if (stored.key) {
+      updateJob(jobId, { storageInputKey: stored.key });
+    }
     await waitForJobPersistence(jobId);
 
     if (isQueueEnabled()) {

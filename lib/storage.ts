@@ -32,6 +32,11 @@ export function localJobDir(jobId: string): string {
   return path.join(process.cwd(), "tmp", jobId);
 }
 
+/** Stable pseudo job folder for a conversation's pending upload (before a real job id exists). */
+export function pendingConversationJobId(conversationId: string): string {
+  return `conv-${conversationId}`;
+}
+
 export async function saveInputVideo(jobId: string, fileName: string, bytes: Buffer): Promise<{ path: string; key?: string }> {
   const extension = path.extname(fileName) || ".mp4";
   const localPath = path.join(localJobDir(jobId), `input${extension}`);

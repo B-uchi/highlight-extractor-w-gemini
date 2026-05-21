@@ -32,10 +32,15 @@ function loadLocalEnvFile(fileName: string): void {
 async function main(): Promise<void> {
   loadLocalEnvFile(".env.local");
 
-  const [{ createPipelineWorker }, { runPipeline }] = await Promise.all([
+  const [{ createPipelineWorker, isQueueEnabled }, { runPipeline }] = await Promise.all([
     import("@/lib/queue"),
     import("@/lib/pipeline"),
   ]);
+
+  if (!isQueueEnabled()) {
+    console.log("Pipeline worker skipped (USE_QUEUE=false). Jobs run inside the Next.js process.");
+    return;
+  }
 
   const worker = createPipelineWorker(async (jobId) => {
     await runPipeline(jobId);

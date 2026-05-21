@@ -12,7 +12,8 @@ import { getGeminiClient, uploadGeminiVideoAndWait } from "@/lib/gemini";
 import { buildCandidateWindows } from "@/lib/pipeline/candidateWindows";
 import { VideoChunk } from "@/lib/pipeline/chunkVideo";
 import { createVisionProxyVideo } from "@/lib/pipeline/proxy";
-import { CandidateWindow, Highlight, TranscriptSegment } from "@/lib/types";
+import { buildPlayerFocusPromptSection } from "@/lib/playerFocus";
+import { CandidateWindow, Highlight, PlayerFocusSpec, TranscriptSegment } from "@/lib/types";
 
 export const DEFAULT_HIGHLIGHT_PROMPT =
   "Find every distinct moment in this video that is highlight-worthy: emotionally strong, surprising, informative, funny, dramatic, or visually engaging. Prefer 20-90 second windows.";
@@ -101,6 +102,10 @@ function normalizeHighlights(highlights: Highlight[], maxDurationSec: number): H
         transcriptQuote: item.transcriptQuote,
         keyFrameSec: item.keyFrameSec,
         audioPeakDb: item.audioPeakDb,
+        playerJersey: item.playerJersey,
+        playerName: item.playerName,
+        teamTag: item.teamTag,
+        visibilityNote: item.visibilityNote,
       };
     })
     .filter((item) => Number.isFinite(item.startSec) && Number.isFinite(item.endSec) && item.endSec > item.startSec);
@@ -151,6 +156,10 @@ function parseGeminiHighlights(raw: string | undefined): Highlight[] {
         transcriptQuote: item.transcriptQuote ? String(item.transcriptQuote) : undefined,
         keyFrameSec: typeof item.keyFrameSec === "number" ? item.keyFrameSec : undefined,
         audioPeakDb: typeof item.audioPeakDb === "number" ? item.audioPeakDb : undefined,
+        playerJersey: item.playerJersey != null ? String(item.playerJersey) : undefined,
+        playerName: item.playerName != null ? String(item.playerName) : undefined,
+        teamTag: item.teamTag != null ? String(item.teamTag) : undefined,
+        visibilityNote: item.visibilityNote != null ? String(item.visibilityNote) : undefined,
       }));
   } catch {
     return [];
@@ -165,6 +174,7 @@ export async function rankVisualHighlights(params: {
   previewVideoPath?: string;
   initialCategory?: VideoCategory | string;
   maxDurationSec: number;
+  playerFocus?: PlayerFocusSpec;
 }): Promise<VisualHighlightsResult> {
   const detectedCategory =
     params.initialCategory && params.initialCategory !== "auto"
@@ -174,7 +184,9 @@ export async function rankVisualHighlights(params: {
           transcriptSegments: params.transcriptSegments,
         });
   const pack = getCategoryPack(detectedCategory);
-  const effectivePrompt = params.userPrompt?.trim() || `${DEFAULT_HIGHLIGHT_PROMPT}\n${pack.prompt}`;
+  const corePrompt = params.userPrompt?.trim() || `${DEFAULT_HIGHLIGHT_PROMPT}\n${pack.prompt}`;
+  const focusBlock = params.playerFocus ? buildPlayerFocusPromptSection(params.playerFocus) : "";
+  const effectivePrompt = focusBlock ? `${corePrompt}\n${focusBlock}` : corePrompt;
   const candidates = buildCandidateWindows({
     transcriptSegments: params.transcriptSegments,
     maxDurationSec: params.maxDurationSec,
@@ -257,7 +269,8 @@ export async function rankVisualHighlights(params: {
                         "Confidence must be a decimal between 0 and 1.",
                         `Category: ${detectedCategory}`,
                         `Allowed event types: ${pack.allowedEventTypes.join(", ")}`,
-                        `Highlight criteria: ${effectivePrompt}`,
+                        ...(focusBlock ? [focusBlock] : []),
+                        `Highlight criteria: ${corePrompt}`,
                         "",
                         "Candidate windows to prioritize (seconds):",
                         candidates.map((window) => `${window.startSec.toFixed(2)}-${window.endSec.toFixed(2)}`).join(", "),
@@ -296,6 +309,10 @@ export async function rankVisualHighlights(params: {
                       transcriptQuote: { type: Type.STRING },
                       keyFrameSec: { type: Type.NUMBER },
                       audioPeakDb: { type: Type.NUMBER },
+                      playerJersey: { type: Type.STRING },
+                      playerName: { type: Type.STRING },
+                      teamTag: { type: Type.STRING },
+                      visibilityNote: { type: Type.STRING },
                     },
                   },
                 },
