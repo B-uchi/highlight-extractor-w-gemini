@@ -635,7 +635,7 @@ export function ConversationWorkspace({
                 className="rounded-lg border border-zinc-800 bg-zinc-950 px-2 py-1 text-xs text-zinc-200 outline-none focus:border-zinc-600"
                 value={
                   conversation?.highlightClipLimit === undefined
-                    ? "15"
+                    ? "5"
                     : conversation.highlightClipLimit === null
                       ? "unlimited"
                       : String(conversation.highlightClipLimit)
