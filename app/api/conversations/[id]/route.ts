@@ -10,7 +10,7 @@ import {
 } from "@/lib/conversations";
 import { getJob, hydrateJobFromStore } from "@/lib/jobs";
 import { isDatabaseEnabled } from "@/lib/db";
-import type { JobState } from "@/lib/types";
+import type { HighlightClipLimitChoice, JobState } from "@/lib/types";
 
 export const runtime = "nodejs";
 
@@ -57,7 +57,11 @@ export async function PATCH(
 ) {
   try {
     const { id } = await context.params;
-    const body = (await request.json()) as { title?: string; archived?: boolean };
+    const body = (await request.json()) as {
+      title?: string;
+      archived?: boolean;
+      highlight_clip_limit?: HighlightClipLimitChoice | "unlimited" | number | string | null;
+    };
     const existing = await getConversation(id);
     if (!existing) {
       return NextResponse.json({ error: "Conversation not found." }, { status: 404 });
@@ -73,6 +77,18 @@ export async function PATCH(
     }
     if (typeof body.archived === "boolean") {
       patch.archivedAt = body.archived ? new Date().toISOString() : null;
+    }
+    if (body.highlight_clip_limit !== undefined) {
+      const v = body.highlight_clip_limit;
+      if (v === null || v === "unlimited") {
+        patch.highlightClipLimit = null;
+      } else if (v === 5 || v === 10 || v === 15) {
+        patch.highlightClipLimit = v;
+      } else if (v === "5" || v === "10" || v === "15") {
+        patch.highlightClipLimit = Number(v) as 5 | 10 | 15;
+      } else {
+        return NextResponse.json({ error: "Invalid highlight_clip_limit." }, { status: 400 });
+      }
     }
 
     if (Object.keys(patch).length === 0) {

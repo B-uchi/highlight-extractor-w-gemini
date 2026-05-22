@@ -5,15 +5,16 @@ import { getCategoryPack } from "@/lib/categories/packs";
 import { appConfig } from "@/lib/config";
 import { detectScenes } from "@/lib/cv/client";
 import { getMediaDurationSec } from "@/lib/ffmpeg";
-import { getJob, hydrateJobFromStore, setJobError, updateJob } from "@/lib/jobs";
+import { getJob, hydrateJobFromStore, appendPipelineLog, setJobError, updateJob } from "@/lib/jobs";
 import { chunkVideo } from "@/lib/pipeline/chunkVideo";
 import { cutClipsForHighlights } from "@/lib/pipeline/cutClips";
 import { createVisionProxyVideo } from "@/lib/pipeline/proxy";
 import { applySceneAwareClipBoundaries } from "@/lib/pipeline/sceneBoundaries";
 import { rankVisualHighlights } from "@/lib/pipeline/visualHighlights";
-import { uploadClipToStorage } from "@/lib/storage";
+import { promoteCutClipsToDurable, uploadClipToStorage } from "@/lib/storage";
 import { isDatabaseEnabled } from "@/lib/db";
 import { upsertAgentTask } from "@/lib/conversations";
+import { resolvedMaxFinalHighlightsForJob } from "@/lib/highlightCap";
 import type { JobState, TranscriptResult } from "@/lib/types";
 
 function getWorkingDir(jobId: string): string {
@@ -36,6 +37,13 @@ export async function runRefineHighlights(jobId: string, newUserPrompt: string):
   const transcript = JSON.parse(transcriptJson) as TranscriptResult;
   const workingDir = getWorkingDir(jobId);
   const startedAtMs = Date.now();
+  const maxH = resolvedMaxFinalHighlightsForJob(job);
+  appendPipelineLog(jobId, {
+    level: "info",
+    stage: "refine",
+    message: "Refine started",
+    detail: `${maxH === 0 ? "unlimited" : maxH} clip cap`,
+  });
 
   try {
     if (job.conversationId && isDatabaseEnabled()) {
@@ -71,6 +79,15 @@ export async function runRefineHighlights(jobId: string, newUserPrompt: string):
       initialCategory: job.category,
       maxDurationSec: videoDurationSec,
       playerFocus: job.playerFocus,
+      maxFinalHighlights: maxH,
+      jobId,
+    });
+
+    appendPipelineLog(jobId, {
+      level: "info",
+      stage: "refine",
+      message: "Re-ranking complete",
+      detail: `${visualRanking.highlights.length} highlights`,
     });
 
     if (visualRanking.usage.totalTokens > appConfig.pipeline.budgetMaxTotalTokens) {
@@ -104,13 +121,30 @@ export async function runRefineHighlights(jobId: string, newUserPrompt: string):
     });
 
     const cutClips = await cutClipsForHighlights(job.inputPath, workingDir, adjusted);
+    appendPipelineLog(jobId, {
+      level: "info",
+      stage: "refine",
+      message: "Re-cut clips in tmp",
+      detail: `${cutClips.length} files`,
+    });
+    const promoted = await promoteCutClipsToDurable(jobId, cutClips);
     const clips = await Promise.all(
-      cutClips.map(async (clip) => ({
-        ...clip,
-        url: await uploadClipToStorage(jobId, clip.id, clip.path),
-      })),
+      promoted.map(async (clip) => {
+        const uploaded = await uploadClipToStorage(jobId, clip.id, clip.path);
+        return {
+          ...clip,
+          url: uploaded.url,
+          ...(uploaded.storageClipKey ? { storageClipKey: uploaded.storageClipKey } : {}),
+        };
+      }),
     );
 
+    appendPipelineLog(jobId, {
+      level: "info",
+      stage: "refine",
+      message: "Refine finished",
+      detail: `${clips.length} clips in durable storage`,
+    });
     const prev = getJob(jobId) ?? (await hydrateJobFromStore(jobId));
     const baseMetrics = prev?.metrics ?? job.metrics;
 

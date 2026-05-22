@@ -16,6 +16,7 @@ import { parsePlayerFocusSpec } from "@/lib/playerFocus";
 import type { AgentStreamEvent } from "@/lib/agent/types";
 import { upsertAgentTask, getConversation, updateConversation } from "@/lib/conversations";
 import { isDatabaseEnabled } from "@/lib/db";
+import { clipLimitChoiceToJobField } from "@/lib/highlightCap";
 import { createJob, waitForJobPersistence, getJob, hydrateJobFromStore, setJobError, updateJob } from "@/lib/jobs";
 import { runPipeline } from "@/lib/pipeline";
 import { runRefineHighlights, summarizeJobForAgent } from "@/lib/pipeline/refine";
@@ -42,6 +43,10 @@ function coerceToolProcessingPresets(raw: unknown): ProcessingPresetsState | und
     "primaryPlayerName",
     "primary_jersey_number",
     "primaryJerseyNumber",
+    "individual_team_name",
+    "individualTeamName",
+    "jersey_color",
+    "jerseyColor",
   ]);
   const touchesKnown = Object.keys(o).some((k) => KNOWN_KEYS.has(k));
   if (!touchesKnown) {
@@ -76,12 +81,28 @@ function coerceToolProcessingPresets(raw: unknown): ProcessingPresetsState | und
         ? o.primaryJerseyNumber.trim()
         : undefined;
 
+  const individualTeamName =
+    typeof o.individual_team_name === "string"
+      ? o.individual_team_name.trim()
+      : typeof o.individualTeamName === "string"
+        ? o.individualTeamName.trim()
+        : undefined;
+
+  const jerseyColor =
+    typeof o.jersey_color === "string"
+      ? o.jersey_color.trim()
+      : typeof o.jerseyColor === "string"
+        ? o.jerseyColor.trim()
+        : undefined;
+
   const placeholders =
-    teamHighlightName || primaryPlayerName || primaryJerseyNumber
+    teamHighlightName || primaryPlayerName || primaryJerseyNumber || individualTeamName || jerseyColor
       ? {
           ...(teamHighlightName ? { teamHighlightName } : {}),
           ...(primaryPlayerName ? { primaryPlayerName } : {}),
           ...(primaryJerseyNumber ? { primaryJerseyNumber } : {}),
+          ...(individualTeamName ? { individualTeamName } : {}),
+          ...(jerseyColor ? { jerseyColor } : {}),
         }
       : undefined;
 
@@ -178,6 +199,8 @@ export function getAgentFunctionDeclarations(): FunctionDeclaration[] {
               team_highlight_name: { type: Type.STRING },
               primary_player_name: { type: Type.STRING },
               primary_jersey_number: { type: Type.STRING },
+              individual_team_name: { type: Type.STRING, description: "Fills [Team Name] in the individual-player preset." },
+              jersey_color: { type: Type.STRING, description: "Fills [jersey color] in the individual-player preset." },
             },
           },
         },
@@ -310,7 +333,17 @@ export async function executeAgentTool(params: {
       const jobId = randomUUID();
       const stored = await saveInputVideo(jobId, basename(conv.pendingInputPath), bytes);
 
-      createJob(jobId, stored.path, combinedPrompt, undefined, category, ctx.conversationId, mergedFocus, mergedPresetState);
+      createJob(
+        jobId,
+        stored.path,
+        combinedPrompt,
+        undefined,
+        category,
+        ctx.conversationId,
+        mergedFocus,
+        mergedPresetState,
+        clipLimitChoiceToJobField(conv.highlightClipLimit),
+      );
       if (stored.key) {
         updateJob(jobId, { storageInputKey: stored.key });
       }

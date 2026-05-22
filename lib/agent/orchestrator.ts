@@ -23,6 +23,7 @@ function buildConversationContextForAgent(conv: ConversationRecord | undefined):
       "Conversation upload state: a video file is already stored for this chat and is ready to process.",
       "Do NOT ask the user to upload a video.",
       "If the user's latest message shows intent to extract highlights, analyze the video, find clips, tune scoring, specify sports/event type, OR gives player/team/roster/jersey targeting (even lengthy), treat that as sufficient to proceed: call start_processing immediately in this turn.",
+      "If their message consists mainly of the merged **Default processing presets** checklist text (markers: \"── Default processing presets ──\" and/or ### section titles like Player Identification Prompt, Output Prompt, etc.), that IS their extraction brief — start_processing now; prompt can quote or tighten that block. Never respond by asking what they want to do with the video.",
       "Do NOT stall with phrases like \"tell me when to start\", \"say when you're ready\", or \"I'll wait for your go\"; only defer if intent is ambiguous (pure small talk/meta questions) or they explicitly postpone.",
       "Populate `prompt` with a concise summary of their highlight/analysis instructions from the latest message(s); merge conversation-saved targeting via `player_focus` when structured fields are evident.",
       "When they explicitly say start/go/run/begin/process, always call start_processing with `prompt` summarizing their instructions and optional `category` if specified.",

@@ -5,6 +5,7 @@ import {
   normalizeProcessingPresetsState,
 } from "@/lib/defaultActions";
 import { createJob, setJobError, updateJob, waitForJobPersistence } from "@/lib/jobs";
+import { clipLimitChoiceToJobField, normalizeHighlightClipLimitFormValue } from "@/lib/highlightCap";
 import { runPipeline } from "@/lib/pipeline";
 import { enqueuePipelineJob, isQueueEnabled } from "@/lib/queue";
 import { saveInputVideo } from "@/lib/storage";
@@ -70,7 +71,19 @@ export async function POST(request: Request) {
 
     const mergedUserPrompt = mergeUserPromptWithPresetBlock(userPrompt, presetBlock || null);
 
-    createJob(jobId, stored.path, mergedUserPrompt, undefined, category, undefined, playerFocus, processingPresets);
+    const hlForm = normalizeHighlightClipLimitFormValue(formData.get("highlightClipLimit"));
+
+    createJob(
+      jobId,
+      stored.path,
+      mergedUserPrompt,
+      undefined,
+      category,
+      undefined,
+      playerFocus,
+      processingPresets,
+      clipLimitChoiceToJobField(hlForm),
+    );
     if (stored.key) {
       updateJob(jobId, { storageInputKey: stored.key });
     }

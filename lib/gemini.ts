@@ -2,6 +2,8 @@ import path from "node:path";
 
 import { File, FileState, GoogleGenAI } from "@google/genai";
 
+import { appConfig } from "@/lib/config";
+
 const FILE_POLL_INTERVAL_MS = 3_000;
 const FILE_POLL_TIMEOUT_MS = 5 * 60_000;
 
@@ -17,7 +19,12 @@ export function getGeminiClient(): GoogleGenAI {
     throw new Error("GEMINI_API_KEY is not set.");
   }
 
-  geminiClient = new GoogleGenAI({ apiKey });
+  geminiClient = new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      timeout: appConfig.gemini.httpTimeoutMs,
+    },
+  });
   return geminiClient;
 }
 

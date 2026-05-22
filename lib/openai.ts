@@ -13,6 +13,8 @@ export function getOpenAIClient(): OpenAI {
 
   client = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY,
+    timeout: Number(process.env.OPENAI_HTTP_TIMEOUT_MS ?? 600_000),
+    maxRetries: 2,
   });
 
   return client;

@@ -51,7 +51,7 @@ async function main(): Promise<void> {
   });
 
   worker.on("failed", (job, error) => {
-    console.error(`Worker failed job: ${job?.id}`, error);
+    console.error(`Worker failed job: ${job?.id}`, JSON.stringify(error));
   });
 
   console.log("Pipeline worker started.");

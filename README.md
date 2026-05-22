@@ -42,7 +42,19 @@ DATABASE_URL=postgresql://postgres:postgres@localhost:5432/video_highlights
 npm run dev
 ```
 
-Optional queue worker:
+The `npm run dev` script starts **three** processes in parallel (`web`, `worker`, `cv`):
+
+| Process | Purpose |
+|---------|---------|
+| web | Next.js dev server (`next dev`), default http://localhost:3000 |
+| worker | Pipeline worker (`tsx scripts/worker.ts`). Only drains BullMQ jobs when `USE_QUEUE=true`; otherwise exits immediately |
+| cv | Python scene worker on port **8000** when `worker-py`/uvicorn is available (`scripts/dev-cv-worker.sh`) |
+
+If `[cv]` exits with **`bad interpreter: No such file or directory`** on `.venv/bin/uvicorn`, the venv was created under an old path after you moved the repo. Recreate it: `cd worker-py && rm -rf .venv && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`.
+
+The pipeline worker runs FFmpeg and AI SDKs **in-process**; it does **not** HTTP-call the Next app. Connection refused (`TypeError: fetch failed` / `ECONNREFUSED`) during a highlight job usually means **`ENABLE_CV_WORKER=true`** but nothing is accepting **`CV_WORKER_URL`** (defaults to `http://localhost:8000`). Wait for the CV process to bind, fix the URL/port, or set **`ENABLE_CV_WORKER=false`** to skip scene-boundary calls — no **`INTERNAL_API_ORIGIN`** or **`NEXT_PUBLIC_*`** vars are involved for pipeline processing.
+
+Optional queue worker (standalone):
 
 ```bash
 npm run worker
@@ -75,7 +87,7 @@ On a **fresh** `postgres_data` volume, `docker compose up -d` runs these files a
 
 See [docs/PLAYER_FOCUS.md](docs/PLAYER_FOCUS.md) for structured player/team targeting (prompt steering, not full-game tracking yet).
 
-Preset **checkbox bundles** merge boilerplate ranking instructions ahead of chat prompts — see [docs/DEFAULT_PROCESSING_PRESETS.md](docs/DEFAULT_PROCESSING_PRESETS.md).
+**Processing actions** on the dashboard: pick checkboxes → **Confirm** to paste merged prompt text into the **chat composer** (or clear to remove it). Messages are **not** sent automatically; edit and press Send. The same choices are synced on the conversation so `start_processing` can reuse them — see [docs/DEFAULT_PROCESSING_PRESETS.md](docs/DEFAULT_PROCESSING_PRESETS.md).
 
 ## Evaluation
 

@@ -1,3 +1,5 @@
+import path from "node:path";
+
 export const appConfig = {
   pipeline: {
     audioChunkDurationSec: Number(process.env.AUDIO_CHUNK_DURATION_SEC ?? 600),
@@ -6,6 +8,8 @@ export const appConfig = {
     geminiConcurrency: Number(process.env.GEMINI_CONCURRENCY ?? 4),
     whisperConcurrency: Number(process.env.WHISPER_CONCURRENCY ?? 4),
     maxHighlightsFinal: Number(process.env.MAX_HIGHLIGHTS_FINAL ?? 15),
+    /** When true, skip FFmpeg audio extract + Whisper; ranking uses visual-only cues (optional empty transcript segments). */
+    skipTranscription: process.env.SKIP_TRANSCRIPTION === "true",
     budgetMaxTotalTokens: Number(process.env.MAX_JOB_TOTAL_TOKENS ?? 300_000),
   },
   clip: {
@@ -26,6 +30,8 @@ export const appConfig = {
     region: process.env.STORAGE_REGION ?? "auto",
     accessKeyId: process.env.STORAGE_ACCESS_KEY_ID ?? "",
     secretAccessKey: process.env.STORAGE_SECRET_ACCESS_KEY ?? "",
+    /** Durable local media root (survives tmp cleanup). Resolved relative to cwd. */
+    dataDir: path.resolve(process.cwd(), process.env.DATA_DIR?.trim() || "storage"),
   },
   jobs: {
     useDatabase: process.env.USE_DATABASE_JOBS === "true",
@@ -34,5 +40,15 @@ export const appConfig = {
   cv: {
     enabled: process.env.ENABLE_CV_WORKER === "true",
     baseUrl: process.env.CV_WORKER_URL ?? "http://localhost:8000",
+  },
+  gemini: {
+    /**
+     * @google/genai default ~10s is too tight for uploads + generateContent over slow networks.
+     * Whole-request timeout (ms), including connects.
+     */
+    httpTimeoutMs: Math.max(
+      10_000,
+      Number(process.env.GEMINI_HTTP_TIMEOUT_MS ?? 180_000),
+    ),
   },
 };

@@ -8,6 +8,7 @@ import { detectVideoCategory } from "@/lib/categories/router";
 import { VideoCategory } from "@/lib/categories/types";
 import { appConfig } from "@/lib/config";
 import { mapWithConcurrency, withRetry } from "@/lib/concurrency";
+import { appendPipelineLog, updateJob } from "@/lib/jobs";
 import { getGeminiClient, uploadGeminiVideoAndWait } from "@/lib/gemini";
 import { buildCandidateWindows } from "@/lib/pipeline/candidateWindows";
 import { VideoChunk } from "@/lib/pipeline/chunkVideo";
@@ -175,6 +176,10 @@ export async function rankVisualHighlights(params: {
   initialCategory?: VideoCategory | string;
   maxDurationSec: number;
   playerFocus?: PlayerFocusSpec;
+  /** Cap after normalization; omit to use MAX_HIGHLIGHTS_FINAL env default. 0 = unlimited. */
+  maxFinalHighlights?: number;
+  /** When set, Gemini chunk progress is appended to job pipeline logs. */
+  jobId?: string;
 }): Promise<VisualHighlightsResult> {
   const detectedCategory =
     params.initialCategory && params.initialCategory !== "auto"
@@ -239,11 +244,31 @@ export async function rankVisualHighlights(params: {
     videoSeconds: 0,
   };
 
+  const totalRankingChunks = params.videoChunks.length;
+  let rankingChunksDone = 0;
+  const bumpRankingProgress = () => {
+    if (!params.jobId || totalRankingChunks === 0) return;
+    rankingChunksDone += 1;
+    const progress = Math.min(84, 70 + Math.floor((rankingChunksDone / totalRankingChunks) * 14));
+    updateJob(params.jobId, {
+      progress,
+      message: `Ranking with Gemini (${rankingChunksDone}/${totalRankingChunks} chunks done)…`,
+    });
+  };
+
   const chunkHighlights = await mapWithConcurrency(
     params.videoChunks,
     appConfig.pipeline.geminiConcurrency,
-    async (chunk) => {
+    async (chunk, index) => {
       usage.videoSeconds += chunk.durationSec;
+      if (params.jobId) {
+        appendPipelineLog(params.jobId, {
+          level: "info",
+          stage: "gemini",
+          message: `Ranking chunk ${index + 1}/${params.videoChunks.length} start`,
+          detail: `${chunk.startSec.toFixed(0)}s+${chunk.durationSec.toFixed(0)}s`,
+        });
+      }
 
       try {
         const proxyDir = path.join(path.dirname(chunk.path), "..", "chunk-proxies");
@@ -335,9 +360,27 @@ export async function rankVisualHighlights(params: {
         if (uploaded.name) {
           await ai.files.delete({ name: uploaded.name }).catch(() => undefined);
         }
+        if (params.jobId) {
+          appendPipelineLog(params.jobId, {
+            level: "info",
+            stage: "gemini",
+            message: `Ranking chunk ${index + 1}/${params.videoChunks.length} done`,
+            detail: `${parsed.length} highlight(s)`,
+          });
+          bumpRankingProgress();
+        }
         return parsed;
       } catch (error) {
         console.error(`Gemini highlight extraction failed for chunk ${chunk.path}`, error);
+        if (params.jobId) {
+          appendPipelineLog(params.jobId, {
+            level: "warn",
+            stage: "gemini",
+            message: `Ranking chunk ${index + 1}/${params.videoChunks.length} failed`,
+            detail: error instanceof Error ? error.message : String(error),
+          });
+          bumpRankingProgress();
+        }
         return [];
       }
     },
@@ -346,14 +389,19 @@ export async function rankVisualHighlights(params: {
 
   const normalized = normalizeHighlights(allHighlights, params.maxDurationSec);
 
+  const cap =
+    params.maxFinalHighlights !== undefined
+      ? params.maxFinalHighlights
+      : appConfig.pipeline.maxHighlightsFinal;
+
   // Final pass: enforce diversity and global ranking.
   const finalHighlights = [...normalized]
-    .sort((a, b) => (b.score + (b.confidence ?? 0) * 100) - (a.score + (a.confidence ?? 0) * 100))
-    .slice(0, appConfig.pipeline.maxHighlightsFinal)
-    .sort((a, b) => a.startSec - b.startSec);
+    .sort((a, b) => b.score + (b.confidence ?? 0) * 100 - (a.score + (a.confidence ?? 0) * 100));
+  const limited = cap > 0 ? finalHighlights.slice(0, cap) : finalHighlights;
+  limited.sort((a, b) => a.startSec - b.startSec);
 
   return {
-    highlights: finalHighlights,
+    highlights: limited,
     effectivePrompt,
     category: detectedCategory,
     candidates,

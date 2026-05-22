@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 
 import { isMockAiMode } from "@/lib/aiMode";
 import { appConfig } from "@/lib/config";
+import { appendPipelineLog } from "@/lib/jobs";
 import { mapWithConcurrency } from "@/lib/concurrency";
 import { getOpenAIClient } from "@/lib/openai";
 import { TranscriptResult, TranscriptSegment } from "@/lib/types";
@@ -28,7 +29,7 @@ export interface TranscriptionRunResult {
   };
 }
 
-export async function transcribeChunks(chunks: AudioChunk[]): Promise<TranscriptionRunResult> {
+export async function transcribeChunks(chunks: AudioChunk[], jobId?: string): Promise<TranscriptionRunResult> {
   if (isMockAiMode()) {
     const segments: TranscriptSegment[] = chunks.map((chunk, index) => ({
       start: chunk.startSec,
@@ -48,13 +49,35 @@ export async function transcribeChunks(chunks: AudioChunk[]): Promise<Transcript
   }
 
   const openai = getOpenAIClient();
-  const responses = await mapWithConcurrency(chunks, appConfig.pipeline.whisperConcurrency, async (chunk) => {
+  const tag = jobId ? `[pipeline ${jobId}]` : "[pipeline]";
+  const responses = await mapWithConcurrency(chunks, appConfig.pipeline.whisperConcurrency, async (chunk, index) => {
+    const started = Date.now();
+    console.info(
+      `${tag} Whisper chunk ${index + 1}/${chunks.length} (${chunk.durationSec.toFixed(0)}s audio from ${chunk.startSec.toFixed(0)}s)...`,
+    );
+    if (jobId) {
+      appendPipelineLog(jobId, {
+        level: "info",
+        stage: "whisper",
+        message: `Whisper chunk ${index + 1}/${chunks.length} start`,
+        detail: `${chunk.durationSec.toFixed(0)}s @ ${chunk.startSec.toFixed(0)}s`,
+      });
+    }
     const response = (await openai.audio.transcriptions.create({
       file: createReadStream(chunk.path),
       model: "whisper-1",
       response_format: "verbose_json",
       timestamp_granularities: ["segment"],
     })) as WhisperVerboseResponse;
+    console.info(`${tag} Whisper chunk ${index + 1}/${chunks.length} done`);
+    if (jobId) {
+      appendPipelineLog(jobId, {
+        level: "info",
+        stage: "whisper",
+        message: `Whisper chunk ${index + 1}/${chunks.length} done`,
+        detail: `${Date.now() - started}ms`,
+      });
+    }
     return { chunk, response };
   });
 

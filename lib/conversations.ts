@@ -102,6 +102,7 @@ export async function updateConversation(
       | "pendingInputPath"
       | "playerFocus"
       | "processingPresets"
+      | "highlightClipLimit"
       | "archivedAt"
     >
   >,
@@ -110,7 +111,9 @@ export async function updateConversation(
   const updatedAt = nowIso();
 
   const targetingChange =
-    patch.playerFocus !== undefined || patch.processingPresets !== undefined;
+    patch.playerFocus !== undefined ||
+    patch.processingPresets !== undefined ||
+    patch.highlightClipLimit !== undefined;
   let nextPlayerFocusJson: Record<string, unknown> | null | undefined = undefined;
   if (targetingChange) {
     const rows = await db
@@ -123,6 +126,7 @@ export async function updateConversation(
     nextPlayerFocusJson = mergeConversationTargetingBlob(currentBlob, {
       ...(patch.playerFocus !== undefined ? { playerFocus: patch.playerFocus } : {}),
       ...(patch.processingPresets !== undefined ? { processingPresets: patch.processingPresets } : {}),
+      ...(patch.highlightClipLimit !== undefined ? { highlightClipLimit: patch.highlightClipLimit } : {}),
     });
   }
 
@@ -209,6 +213,64 @@ export async function listMessagesForConversation(conversationId: string): Promi
   }));
 }
 
+export async function updateUserMessageContent(params: {
+  conversationId: string;
+  messageId: string;
+  content: string;
+}): Promise<ChatMessageRecord | undefined> {
+  const db = requireDb();
+  const rows = await db
+    .select()
+    .from(messagesTable)
+    .where(and(eq(messagesTable.id, params.messageId), eq(messagesTable.conversationId, params.conversationId)))
+    .limit(1);
+
+  const row = rows[0];
+  if (!row || row.role !== "user") {
+    return undefined;
+  }
+
+  const trimmed = params.content.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  const prevMeta = (row.metadata as Record<string, unknown> | null) ?? {};
+  const nextMeta: Record<string, unknown> = { ...prevMeta, editedAt: nowIso() };
+
+  await db
+    .update(messagesTable)
+    .set({
+      content: trimmed,
+      metadata: nextMeta,
+    })
+    .where(eq(messagesTable.id, params.messageId));
+
+  await db
+    .update(conversationsTable)
+    .set({ updatedAt: new Date() })
+    .where(eq(conversationsTable.id, params.conversationId));
+
+  const [updatedRow] = await db
+    .select()
+    .from(messagesTable)
+    .where(eq(messagesTable.id, params.messageId))
+    .limit(1);
+
+  if (!updatedRow) {
+    return undefined;
+  }
+
+  return {
+    id: updatedRow.id,
+    conversationId: updatedRow.conversationId,
+    role: updatedRow.role as ChatRole,
+    content: updatedRow.content,
+    metadata: updatedRow.metadata as Record<string, unknown> | null,
+    createdAt: updatedRow.createdAt.toISOString(),
+  };
+}
+
 export async function listAgentTasksForConversation(conversationId: string): Promise<AgentTaskRecord[]> {
   const db = requireDb();
   const rows = await db
@@ -221,7 +283,7 @@ export async function listAgentTasksForConversation(conversationId: string): Pro
 }
 
 function mapConversationRow(row: typeof conversationsTable.$inferSelect): ConversationRecord {
-  const { playerFocus, processingPresets } = parseConversationTargetingBlob(row.playerFocusJson);
+  const { playerFocus, processingPresets, highlightClipLimit } = parseConversationTargetingBlob(row.playerFocusJson);
 
   return {
     id: row.id,
@@ -230,6 +292,7 @@ function mapConversationRow(row: typeof conversationsTable.$inferSelect): Conver
     pendingInputPath: row.pendingInputPath ?? null,
     playerFocus,
     processingPresets,
+    ...(highlightClipLimit !== undefined ? { highlightClipLimit } : {}),
     archivedAt: row.archivedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),

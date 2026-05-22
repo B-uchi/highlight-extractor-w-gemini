@@ -23,81 +23,106 @@ export interface DefaultProcessingActionDefinition {
 const ORDER_INDEX: Record<string, number> = Object.fromEntries(PROCESSING_ACTION_IDS.map((id, index) => [id, index]));
 
 /**
- * Canonical copy used when users pick default processing actions from the dashboard.
- * Placeholders `[Team Highlight Name]`, `[Player Name]`, `[Jersey Number]` are swapped when preset fields are filled (otherwise left literal for the agent or API to specialize).
+ * Default processing actions — prompt text matches the product brief verbatim (see docs).
+ * Substitution: `Triple Threat Athletics`, `[Player Name]`, `[Number]`, `[Jersey Number]`, `[Team Name]`, `[jersey color]` when preset fields are set.
  */
 export const DEFAULT_PROCESSING_ACTIONS: DefaultProcessingActionDefinition[] = [
   {
     id: "player_identification",
-    title: "Player Identification",
-    description:
-      "Chunked visual analysis with roster/context — excludes full-game biometric tracking guarantees.",
-    promptTemplate: `Player / identity identification (critical context):
-- Each model call observes only short video clips, never the continuous game feed in one inference.
-- Roster jerseys, heights, accessory notes, photos, or user descriptions are probabilistic priors — not cryptographic proof across cuts, substitutions, fouls out, obscured jerseys, distant cameras, washed-out numbers, towel heads, mirrored streams, duplicate numbers, wrong roster weeks, compression artifacts, intentional deception, stunt doubles, mascot confusion, meme edits, CGI, recap footage intercut with live gameplay, referee bodies blocking digits, swapped feeds, swapped teams, halftime outfit changes.
-- Maintain honest visibility: populate playerJersey / playerName only when visibly grounded during that window; omit or downgrade score when occlusion or ambiguity dominates.
-- If user references “full scan” roster expectations, prioritize consistent kit colors + plausible jersey reads and explain uncertainty succinctly.`,
+    title: "Player Identification Prompt",
+    description: "Full-game identity brief, required/optional inputs, and example line.",
+    promptTemplate: `Prompt:
+
+"Scan the full game video and identify every player from Team A using jersey color, jersey number, player roster, and uniform design. Track each player throughout the game, even when they move off-ball, are partially blocked, or switch sides of the court."
+
+Required inputs:
+
+Team name
+Jersey color
+Player number
+Player name
+Optional: player photo/headshot
+Optional: height/body profile
+Optional: shoe/sleeve/accessory identifiers
+
+Example:
+
+"Find and track Player #3 on the black Triple Threat Athletics team. Isolate all possessions where #3 is involved in the play, including scoring, assists, rebounds, steals, blocks, defensive stops, ball handling, and transition plays."`,
   },
   {
     id: "highlight_events",
-    title: "Highlight Event Detection",
-    description: "Breadth of plausible highlight classes to catch game story beats and human moments.",
-    promptTemplate: `Highlight event detection — consider (non-exhaustive):
-Sports / competition: explosive scores, steals, turnovers, chasedown blocks, open-field breaks, nutmegs/dribble beats, goalie saves, spikes/aces/service winners, knockout counters, comeback swings, rivalry jawing, benches erupting.
-Broadcast / hype: trophy reveals, countdown hits, MVP chants, walk-up intros, ceremonial moments.
-Talk / podcast / interview: witty punchlines, sharp rebuttals, surprising admissions, argument peaks, applause/laughter storms, mic-drop tone shifts.
-Education / demos: paradigm shifts (“aha” beats), slick visual reveals, catastrophic fails that teach.
-Prefer distinct narrative peaks; discard generic filler unless anchored by unusually strong visuals or transcript punch.`,
+    title: "Highlight Event Detection Prompt",
+    description: "Basketball events where the player makes a positive impact.",
+    promptTemplate: `Prompt:
+
+"Create a highlight reel for each player by detecting basketball events where the player makes a positive impact."
+
+Events to pull:
+
+Made 3-point shots
+Made jump shots
+Layups
+Finishes through contact
+Dunks
+Assists
+Hockey assists / pass leading to score
+Rebounds
+Steals
+Blocks
+Defensive stops
+Deflections
+Fast breaks
+Ball handling / breakdowns
+Good passes
+Hustle plays
+Charges taken
+And-1 plays`,
   },
   {
     id: "team_highlight",
-    title: "Team-Based Highlight ([Team Highlight Name])",
-    description:
-      "Momentum edit for one club — placeholders filled from the presets panel `[Team Highlight Name]` (falls back left as bracket text).",
-    promptTemplate: `Team-centric highlight reel brief for **[Team Highlight Name]**:
-1) First pick sequences where team identity is visibly readable (kits, sidelines, scorer graphics, coherent camera color bias).
-2) Emphasize **runs / swings / defensive stands / transition bursts** telling a team story—not isolated random scores from unclear angles.
-3) Include bench/coach reactions only when tightly coupled to meaningful team momentum swings.
-4) When another team dominates a stretch, shorten or downgrade unless it sets up **[Team Highlight Name]**'s answer.
-5) Keep titles short and declare team tag when grounded.`,
+    title: "Team-Based Highlight Prompt",
+    description: "Team film brief; preset “Team name” replaces Triple Threat Athletics when filled.",
+    promptTemplate: `Prompt:
+
+"Create a team highlight film for Triple Threat Athletics. Prioritize clips where our team scores, forces turnovers, gets stops, moves the ball well, plays in transition, or shows high-energy team basketball."`,
   },
   {
     id: "individual_player_highlight",
-    title: "Individual Player Highlight",
-    description: "Isolation brief with `[Player Name]` / `[Jersey Number]` substitutions from preset fields.",
-    promptTemplate: `Individual player reel for **[Player Name]** (jersey **#[Jersey Number]** priority when visible):
-- Score meaningful offensive touches **and** impactful defensive rotations, boards, steals, hustle saves, inbound IQ, communicator leadership if visually obvious.
-- If the jersey is obstructed mid-play, widen context slightly ONLY when continuity still plausibly follows the primary subject; otherwise reduce score and explain visibility honesty.
-- Deprioritize incidental crowd shots lacking clear player involvement.`,
+    title: "Individual Player Highlight Prompt",
+    description: "60–90s reel; panel fields substitute [Player Name], #[Number], [Team Name], [jersey color].",
+    promptTemplate: `Prompt:
+
+"Create a 60–90 second highlight video for [Player Name], jersey #[Number], on [Team Name], wearing [jersey color]. Pull only positive plays where this player is clearly involved. Include 1 second before the play develops and 2 seconds after the play ends."`,
   },
   {
     id: "clip_quality_rules",
     title: "Clip Quality Rules",
-    description: "Edit hygiene for watchable standalone clips.",
-    promptTemplate: `Clip quality hygiene:
-- Windows should feel **watchable standalone** (~20-90s ideally) with clean story beats—not mid-sentence hard cuts unless irony demands it.
-- Avoid dead filler pre-roll unless building deliberate tension rewarded within the clip.
-- Favor sharper exposure, stabilized framing, and readable captions/graphics aiding context.
-- If audio is muddy, lean on unmistakable visuals or transcript corroboration; flag weakness in reason.`,
+    description: "Visibility, meaning, and negative filters.",
+    promptTemplate: `Prompt:
+
+"Only select clips where the player is clearly visible, the action is meaningful, and the play result is positive. Remove dead time, inbound delays, free throws unless they complete an and-1, and clips where the player is not clearly identifiable."`,
   },
   {
     id: "ranking_prompt",
     title: "Ranking Prompt",
-    description: "Heuristic blend for comparative scoring.",
-    promptTemplate: `Ranking & tie-break intuition:
-Combine **novelty**, **spectacle/emotion**, **narrative closure**, **clarity**, and **rarity** vs repetitive similar moments.
-Prefer fewer, stronger clips over many borderline echoes.
-Sporting plays: elevate game-altering swings, iconic skill bursts, contagious bench energy.`,
+    description: "Explicit highlight-value ordering.",
+    promptTemplate: `Prompt:
+
+"Rank clips by highlight value using this order: dunks, blocks, steals leading to points, made threes, assists, tough finishes, transition plays, rebounds, defensive stops, hustle plays."`,
   },
   {
     id: "output_prompt",
     title: "Output Prompt",
-    description: "How to annotate each highlight blob for downstream UI + editors.",
-    promptTemplate: `Output rigor:
-- Return machine-parseable arrays of highlight objects respecting schema (timestamps absolute to source media).
-- Titles ≤ ~8 words, punchy, no spoiler spam unless payoff earned.
-- reason: 2–4 sentences bridging **why** this beat matters vs neighbors.
-- eventType/category/tags should be specific (not just "highlight") when evidence supports.`,
+    description: "Export/label format with example lines.",
+    promptTemplate: `Prompt:
+
+"Export clips by player name and jersey number. Label each clip with player, event type, timestamp, and confidence score. Create both raw clips and a finished highlight reel."
+
+Example output:
+
+Bryn Amiwero #3 — Made 3PT — 04:22 — 92% confidence
+Bryn Amiwero #3 — Assist — 08:17 — 88% confidence
+Bryn Amiwero #3 — Steal + Layup — 13:44 — 94% confidence`,
   },
 ];
 
@@ -112,19 +137,33 @@ function sortSelectedIds(ids: string[]): ProcessingActionId[] {
 function applyPresetPlaceholders(
   rawTemplate: string,
   placeholders?: ProcessingPresetsPlaceholders | null,
+  /** Only `team_highlight` should rewrite the literal organization name in the template */
+  actionId?: ProcessingActionId,
 ): string {
   if (!placeholders) {
     return rawTemplate;
   }
   let text = rawTemplate;
   if (placeholders.teamHighlightName?.trim()) {
-    text = text.split("[Team Highlight Name]").join(placeholders.teamHighlightName.trim());
+    const team = placeholders.teamHighlightName.trim();
+    if (actionId === "team_highlight") {
+      text = text.split("Triple Threat Athletics").join(team);
+    }
+    text = text.split("[Team Highlight Name]").join(team);
   }
   if (placeholders.primaryPlayerName?.trim()) {
     text = text.split("[Player Name]").join(placeholders.primaryPlayerName.trim());
   }
-  if (placeholders.primaryJerseyNumber?.trim()) {
-    text = text.split("[Jersey Number]").join(placeholders.primaryJerseyNumber.trim());
+  const jersey = placeholders.primaryJerseyNumber?.trim();
+  if (jersey) {
+    text = text.split("[Number]").join(jersey);
+    text = text.split("[Jersey Number]").join(jersey);
+  }
+  if (placeholders.individualTeamName?.trim()) {
+    text = text.split("[Team Name]").join(placeholders.individualTeamName.trim());
+  }
+  if (placeholders.jerseyColor?.trim()) {
+    text = text.split("[jersey color]").join(placeholders.jerseyColor.trim());
   }
   return text;
 }
@@ -143,12 +182,15 @@ export function buildCombinedPrompt(
 
   const blocks = sorted.map((id) => {
     const definition = PROMPT_LOOKUP[id];
-    const body = applyPresetPlaceholders(definition.promptTemplate, placeholders ?? null);
+    const body = applyPresetPlaceholders(definition.promptTemplate, placeholders ?? null, id);
     return [`### ${definition.title}`, body.trim()].join("\n");
   });
 
   return ["── Default processing presets ──", "", ...blocks].join("\n");
 }
+
+/** Same separator as server-side merge — keep in sync when stripping preset blocks from the chat composer. */
+export const PROCESSING_PRESET_USER_SEPARATOR = "\n\n────────\n\n";
 
 export function mergeUserPromptWithPresetBlock(
   freeformPrompt?: string | null,
@@ -164,7 +206,58 @@ export function mergeUserPromptWithPresetBlock(
     return undefined;
   }
 
-  return parts.join("\n\n────────\n\n");
+  return parts.join(PROCESSING_PRESET_USER_SEPARATOR);
+}
+
+/**
+ * Remove the last injected preset block (and the standard separator before following free text) from composer text.
+ */
+export function stripLastInjectedPresetFromComposer(full: string, lastBlock: string | null): string {
+  if (!lastBlock) {
+    return full;
+  }
+  const idx = full.indexOf(lastBlock);
+  if (idx === -1) {
+    return full;
+  }
+  const before = full.slice(0, idx);
+  let after = full.slice(idx + lastBlock.length);
+  if (after.startsWith(PROCESSING_PRESET_USER_SEPARATOR)) {
+    after = after.slice(PROCESSING_PRESET_USER_SEPARATOR.length);
+  } else {
+    after = after.replace(/^(\n\n)+/, "");
+  }
+  return (before + after).trim();
+}
+
+/**
+ * Replace or append the merged preset block into the chat composer, preserving user free text below the standard separator.
+ * See README (dashboard): text is only placed in the composer — not auto-sent.
+ */
+export function applyPresetBlockToComposerText(
+  current: string,
+  lastInjectedBlock: string | null,
+  newPresetBlock: string,
+): { next: string; nextLastBlock: string | null } {
+  const trimmedCurrent = current.trimEnd();
+  const trimmedNew = newPresetBlock.trimEnd();
+
+  // No-op if the composer already ends with this exact merged block (avoids duplicate append on re-save).
+  if (trimmedNew && trimmedCurrent.endsWith(trimmedNew)) {
+    return { next: current, nextLastBlock: newPresetBlock || null };
+  }
+
+  const free = stripLastInjectedPresetFromComposer(current, lastInjectedBlock);
+  const freeTrimmed = free.trim();
+  const merged = mergeUserPromptWithPresetBlock(
+    freeTrimmed.length ? freeTrimmed : null,
+    newPresetBlock.length ? newPresetBlock : null,
+  );
+
+  return {
+    next: merged ?? freeTrimmed,
+    nextLastBlock: newPresetBlock.length ? newPresetBlock : null,
+  };
 }
 
 /**
@@ -198,6 +291,12 @@ export function mergeProcessingPresetsState(
     ...(mergedPlaceholdersRaw.primaryJerseyNumber?.trim()
       ? { primaryJerseyNumber: mergedPlaceholdersRaw.primaryJerseyNumber.trim() }
       : {}),
+    ...(mergedPlaceholdersRaw.individualTeamName?.trim()
+      ? { individualTeamName: mergedPlaceholdersRaw.individualTeamName.trim() }
+      : {}),
+    ...(mergedPlaceholdersRaw.jerseyColor?.trim()
+      ? { jerseyColor: mergedPlaceholdersRaw.jerseyColor.trim() }
+      : {}),
   };
 
   return normalizeProcessingPresetsState({
@@ -218,6 +317,8 @@ export function normalizeProcessingPresetsState(raw: ProcessingPresetsState | nu
           ...(typeof ph.teamHighlightName === "string" ? { teamHighlightName: ph.teamHighlightName.trim() } : {}),
           ...(typeof ph.primaryPlayerName === "string" ? { primaryPlayerName: ph.primaryPlayerName.trim() } : {}),
           ...(typeof ph.primaryJerseyNumber === "string" ? { primaryJerseyNumber: ph.primaryJerseyNumber.trim() } : {}),
+          ...(typeof ph.individualTeamName === "string" ? { individualTeamName: ph.individualTeamName.trim() } : {}),
+          ...(typeof ph.jerseyColor === "string" ? { jerseyColor: ph.jerseyColor.trim() } : {}),
         }
       : undefined;
 
@@ -225,7 +326,9 @@ export function normalizeProcessingPresetsState(raw: ProcessingPresetsState | nu
     placeholders &&
     (Boolean(placeholders.teamHighlightName?.length) ||
       Boolean(placeholders.primaryPlayerName?.length) ||
-      Boolean(placeholders.primaryJerseyNumber?.length));
+      Boolean(placeholders.primaryJerseyNumber?.length) ||
+      Boolean(placeholders.individualTeamName?.length) ||
+      Boolean(placeholders.jerseyColor?.length));
 
   return ids.length === 0 && !hasAnyPlaceholder
     ? null

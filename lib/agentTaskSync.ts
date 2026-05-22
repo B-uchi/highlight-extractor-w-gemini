@@ -12,8 +12,18 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
 
   const conversationId = job.conversationId;
   const jobId = job.id;
+  const stage = job.stage as JobStage;
 
-  const detail = job.stage === "error" && job.error ? `${job.message}: ${job.error}` : job.message;
+  const errorLine = stage === "error" && job.error ? `${job.message}: ${job.error}` : job.message;
+
+  const transcribePrepDetail = (): string =>
+    stage === "extracting_audio"
+      ? "Extracting audio with FFmpeg"
+      : stage === "chunking_audio"
+        ? "Splitting audio into chunks"
+        : stage === "transcribing"
+          ? "Calling OpenAI Whisper (long uploads can take many minutes)."
+          : "Preparing transcription";
 
   const upsert = async (params: {
     id: string;
@@ -21,6 +31,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
     status: "pending" | "running" | "done" | "error";
     progress: number;
     label: string;
+    detail: string | null;
   }) => {
     await upsertAgentTask({
       id: params.id,
@@ -30,22 +41,21 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: params.status,
       progress: params.progress,
       label: params.label,
-      detail,
+      detail: params.detail,
     }).catch((error) => {
       console.warn("[agentTaskSync] upsert failed", error);
     });
   };
 
-  // Upload is immediate once the multipart lands — keep as done for visibility.
+  // Upload row
   await upsert({
     id: `${jobId}-upload`,
     type: "upload",
-    status: job.stage === "error" ? "error" : "done",
-    progress: job.stage === "error" ? 100 : 100,
+    status: stage === "error" && (job.failedAtStage ?? "") === "queued" ? "error" : "done",
+    progress: 100,
     label: "Receive video",
+    detail: stage === "error" && (job.failedAtStage ?? "") === "queued" ? errorLine : "Uploaded and queued for pipeline",
   });
-
-  const stage = job.stage as JobStage;
 
   if (stage === "queued") {
     await upsert({
@@ -54,6 +64,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "pending",
       progress: 0,
       label: "Transcribe audio",
+      detail: "Waiting for pipeline…",
     });
     await upsert({
       id: `${jobId}-rank`,
@@ -61,6 +72,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "pending",
       progress: 0,
       label: "Find highlights",
+      detail: "Starts after Whisper",
     });
     await upsert({
       id: `${jobId}-cut`,
@@ -68,6 +80,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "pending",
       progress: 0,
       label: "Cut clips",
+      detail: "Starts after ranking",
     });
     return;
   }
@@ -79,6 +92,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "running",
       progress: job.progress,
       label: "Transcribe audio",
+      detail: transcribePrepDetail(),
     });
     await upsert({
       id: `${jobId}-rank`,
@@ -86,6 +100,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "pending",
       progress: 0,
       label: "Find highlights",
+      detail: "Starts after Whisper",
     });
     await upsert({
       id: `${jobId}-cut`,
@@ -93,6 +108,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "pending",
       progress: 0,
       label: "Cut clips",
+      detail: "Starts after ranking",
     });
     return;
   }
@@ -104,6 +120,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "done",
       progress: 100,
       label: "Transcribe audio",
+      detail: "Transcription finished",
     });
     await upsert({
       id: `${jobId}-rank`,
@@ -111,6 +128,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "running",
       progress: job.progress,
       label: "Find highlights",
+      detail: job.message,
     });
     await upsert({
       id: `${jobId}-cut`,
@@ -118,6 +136,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "pending",
       progress: 0,
       label: "Cut clips",
+      detail: "Starts after ranking",
     });
     return;
   }
@@ -129,6 +148,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "done",
       progress: 100,
       label: "Transcribe audio",
+      detail: "Transcription finished",
     });
     await upsert({
       id: `${jobId}-rank`,
@@ -136,6 +156,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "done",
       progress: 100,
       label: "Find highlights",
+      detail: "Highlight ranking complete",
     });
     await upsert({
       id: `${jobId}-cut`,
@@ -143,6 +164,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "running",
       progress: job.progress,
       label: "Cut clips",
+      detail: job.message,
     });
     return;
   }
@@ -154,6 +176,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "done",
       progress: 100,
       label: "Transcribe audio",
+      detail: "Transcription finished",
     });
     await upsert({
       id: `${jobId}-rank`,
@@ -161,6 +184,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "done",
       progress: 100,
       label: "Find highlights",
+      detail: "Highlight ranking complete",
     });
     await upsert({
       id: `${jobId}-cut`,
@@ -168,6 +192,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
       status: "done",
       progress: 100,
       label: "Cut clips",
+      detail: "Clips exported",
     });
     return;
   }
@@ -175,13 +200,14 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
   if (stage === "error") {
     const at = job.failedAtStage ?? "queued";
 
-    if (at === "extracting_audio" || at === "chunking_audio" || at === "transcribing" || at === "queued") {
+    if (at === "queued") {
       await upsert({
         id: `${jobId}-transcribe`,
         type: "transcribe",
-        status: "error",
-        progress: job.progress,
+        status: "pending",
+        progress: 0,
         label: "Transcribe audio",
+        detail: "Pipeline failed before preprocessing",
       });
       await upsert({
         id: `${jobId}-rank`,
@@ -189,6 +215,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
         status: "pending",
         progress: 0,
         label: "Find highlights",
+        detail: "Did not run",
       });
       await upsert({
         id: `${jobId}-cut`,
@@ -196,6 +223,35 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
         status: "pending",
         progress: 0,
         label: "Cut clips",
+        detail: "Did not run",
+      });
+      return;
+    }
+
+    if (at === "extracting_audio" || at === "chunking_audio" || at === "transcribing") {
+      await upsert({
+        id: `${jobId}-transcribe`,
+        type: "transcribe",
+        status: "error",
+        progress: job.progress,
+        label: "Transcribe audio",
+        detail: errorLine,
+      });
+      await upsert({
+        id: `${jobId}-rank`,
+        type: "rank",
+        status: "pending",
+        progress: 0,
+        label: "Find highlights",
+        detail: "Blocked by transcription error",
+      });
+      await upsert({
+        id: `${jobId}-cut`,
+        type: "cut",
+        status: "pending",
+        progress: 0,
+        label: "Cut clips",
+        detail: "Blocked by transcription error",
       });
       return;
     }
@@ -207,6 +263,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
         status: "done",
         progress: 100,
         label: "Transcribe audio",
+        detail: "Transcription finished",
       });
       await upsert({
         id: `${jobId}-rank`,
@@ -214,6 +271,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
         status: "error",
         progress: job.progress,
         label: "Find highlights",
+        detail: errorLine,
       });
       await upsert({
         id: `${jobId}-cut`,
@@ -221,6 +279,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
         status: "pending",
         progress: 0,
         label: "Cut clips",
+        detail: "Blocked by ranking error",
       });
       return;
     }
@@ -232,6 +291,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
         status: "done",
         progress: 100,
         label: "Transcribe audio",
+        detail: "Transcription finished",
       });
       await upsert({
         id: `${jobId}-rank`,
@@ -239,6 +299,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
         status: "done",
         progress: 100,
         label: "Find highlights",
+        detail: "Highlight ranking complete",
       });
       await upsert({
         id: `${jobId}-cut`,
@@ -246,6 +307,7 @@ export async function syncAgentTasksFromJobState(job: JobState): Promise<void> {
         status: "error",
         progress: job.progress,
         label: "Cut clips",
+        detail: errorLine,
       });
     }
   }

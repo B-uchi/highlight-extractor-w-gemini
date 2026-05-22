@@ -6,12 +6,17 @@ import { useCallback, useEffect, useState } from "react";
 
 import { ConversationSidebarItem } from "@/components/dashboard/ConversationSidebarItem";
 import type { ConversationRecord } from "@/lib/types";
+import Link from "next/link";
 
 export function DashboardShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const [conversations, setConversations] = useState<ConversationRecord[] | null>(null);
-  const [archivedConversations, setArchivedConversations] = useState<ConversationRecord[]>([]);
+  const [conversations, setConversations] = useState<
+    ConversationRecord[] | null
+  >(null);
+  const [archivedConversations, setArchivedConversations] = useState<
+    ConversationRecord[]
+  >([]);
   const [error, setError] = useState<string | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
@@ -58,7 +63,10 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({}),
     });
-    const payload = (await res.json()) as { conversation?: ConversationRecord; error?: string };
+    const payload = (await res.json()) as {
+      conversation?: ConversationRecord;
+      error?: string;
+    };
     if (!res.ok || !payload.conversation) {
       setError(payload.error ?? "Could not create conversation.");
       return;
@@ -69,13 +77,17 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
 
   const sidebar = (
     <aside className="flex h-full w-64 shrink-0 flex-col border-r border-zinc-800 bg-zinc-950">
-      <div className="flex items-center gap-2 border-b border-zinc-800 p-3">
-        <Video className="h-5 w-5 text-blue-400" />
-        <div className="min-w-0">
-          <p className="truncate text-sm font-semibold text-zinc-100">Video Highlights</p>
-          <p className="truncate text-xs text-zinc-500">Agent dashboard</p>
+      <Link href="/dashboard">
+        <div className="flex items-center gap-2 border-b border-zinc-800 p-3">
+          <Video className="h-5 w-5 text-blue-400" />
+          <div className="min-w-0">
+            <p className="truncate text-sm font-semibold text-zinc-100">
+              Video Highlights
+            </p>
+            <p className="truncate text-xs text-zinc-500">Agent dashboard</p>
+          </div>
         </div>
-      </div>
+      </Link>
 
       <div className="p-2">
         <button
@@ -94,13 +106,21 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
             {error}
             <div className="mt-2 text-[11px] text-amber-200/80">
               Conversations require Postgres. Run{" "}
-              <code className="rounded bg-black/30 px-1">docker compose up -d</code> and set{" "}
-              <code className="rounded bg-black/30 px-1">USE_DATABASE_JOBS=true</code> with{" "}
+              <code className="rounded bg-black/30 px-1">
+                docker compose up -d
+              </code>{" "}
+              and set{" "}
+              <code className="rounded bg-black/30 px-1">
+                USE_DATABASE_JOBS=true
+              </code>{" "}
+              with{" "}
               <code className="rounded bg-black/30 px-1">DATABASE_URL</code>.
             </div>
           </div>
         )}
-        <p className="mb-2 px-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">Recent</p>
+        <p className="mb-2 px-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">
+          Recent
+        </p>
         <ul className="space-y-1">
           {(conversations ?? []).map((c) => (
             <li key={c.id}>
@@ -152,7 +172,9 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
             aria-label="Close sidebar"
             onClick={() => setSidebarOpen(false)}
           />
-          <div className="relative z-50 h-full w-[min(20rem,85vw)] shadow-xl">{sidebar}</div>
+          <div className="relative z-50 h-full w-[min(20rem,85vw)] shadow-xl">
+            {sidebar}
+          </div>
         </div>
       )}
 

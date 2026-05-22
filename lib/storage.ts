@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { Readable as NodeReadable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -8,6 +8,7 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 import { appConfig } from "@/lib/config";
+import type { GeneratedClip } from "@/lib/types";
 
 function createS3Client(): S3Client {
   return new S3Client({
@@ -28,8 +29,14 @@ export function isObjectStorageEnabled(): boolean {
   return appConfig.storage.mode === "s3";
 }
 
+/** Temp working dir for FFmpeg intermediates (transcript chunks, proxies). */
 export function localJobDir(jobId: string): string {
   return path.join(process.cwd(), "tmp", jobId);
+}
+
+/** Durable on-disk assets for reloadable playback (survives tmp cleanup). */
+export function durableJobMediaDir(jobId: string): string {
+  return path.join(appConfig.storage.dataDir, "jobs", jobId);
 }
 
 /** Stable pseudo job folder for a conversation's pending upload (before a real job id exists). */
@@ -37,10 +44,15 @@ export function pendingConversationJobId(conversationId: string): string {
   return `conv-${conversationId}`;
 }
 
+export function clipObjectStorageKey(jobId: string, clipId: string): string {
+  return `clips/${jobId}/${clipId}.mp4`;
+}
+
 export async function saveInputVideo(jobId: string, fileName: string, bytes: Buffer): Promise<{ path: string; key?: string }> {
   const extension = path.extname(fileName) || ".mp4";
-  const localPath = path.join(localJobDir(jobId), `input${extension}`);
-  await mkdir(localJobDir(jobId), { recursive: true });
+  const jobDir = durableJobMediaDir(jobId);
+  const localPath = path.join(jobDir, `input${extension}`);
+  await mkdir(jobDir, { recursive: true });
   await writeFile(localPath, bytes);
 
   if (!isObjectStorageEnabled()) {
@@ -60,12 +72,28 @@ export async function saveInputVideo(jobId: string, fileName: string, bytes: Buf
   return { path: localPath, key };
 }
 
-export async function uploadClipToStorage(jobId: string, clipId: string, clipPath: string): Promise<string> {
+export async function promoteCutClipsToDurable(jobId: string, clips: GeneratedClip[]): Promise<GeneratedClip[]> {
+  const destRoot = path.join(durableJobMediaDir(jobId), "clips");
+  await mkdir(destRoot, { recursive: true });
+  return Promise.all(
+    clips.map(async (clip) => {
+      const dest = path.join(destRoot, `${clip.id}.mp4`);
+      await copyFile(clip.path, dest);
+      return { ...clip, path: dest };
+    }),
+  );
+}
+
+export async function uploadClipToStorage(
+  jobId: string,
+  clipId: string,
+  clipPath: string,
+): Promise<{ url: string; storageClipKey?: string }> {
   if (!isObjectStorageEnabled()) {
-    return `/api/clip/${jobId}/${clipId}`;
+    return { url: `/api/clip/${jobId}/${clipId}` };
   }
 
-  const key = `clips/${jobId}/${clipId}.mp4`;
+  const key = clipObjectStorageKey(jobId, clipId);
   const s3 = createS3Client();
   await s3.send(
     new PutObjectCommand({
@@ -76,14 +104,17 @@ export async function uploadClipToStorage(jobId: string, clipId: string, clipPat
     }),
   );
 
-  return `${appConfig.storage.basePublicUrl.replace(/\/$/, "")}/${key}`;
+  return {
+    url: `${appConfig.storage.basePublicUrl.replace(/\/$/, "")}/${key}`,
+    storageClipKey: key,
+  };
 }
 
 export async function downloadClipToFile(jobId: string, clipId: string, destPath: string): Promise<void> {
   if (!isObjectStorageEnabled()) {
     throw new Error("Object storage is not enabled; cannot download clip from bucket.");
   }
-  const key = `clips/${jobId}/${clipId}.mp4`;
+  const key = clipObjectStorageKey(jobId, clipId);
   const s3 = createS3Client();
   const result = await s3.send(
     new GetObjectCommand({
@@ -102,7 +133,7 @@ export async function getClipReadUrl(jobId: string, clipId: string): Promise<str
   if (!isObjectStorageEnabled()) {
     return `/api/clip/${jobId}/${clipId}`;
   }
-  const key = `clips/${jobId}/${clipId}.mp4`;
+  const key = clipObjectStorageKey(jobId, clipId);
   const s3 = createS3Client();
   return getSignedUrl(
     s3,

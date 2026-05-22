@@ -10,9 +10,15 @@ export type JobStage =
 
 /** Optional substitutions for templated preset copy (dashboard + agent overlays). */
 export interface ProcessingPresetsPlaceholders {
+  /** Replaces `Triple Threat Athletics` in the team-based preset when set */
   teamHighlightName?: string;
   primaryPlayerName?: string;
+  /** Fills `#[Number]` / `[Jersey Number]` in individual-player preset */
   primaryJerseyNumber?: string;
+  /** Fills `[Team Name]` in individual-player preset */
+  individualTeamName?: string;
+  /** Fills `[jersey color]` in individual-player preset */
+  jerseyColor?: string;
 }
 
 /** Multi-select checklist + placeholder values mirrored onto jobs when processing starts. */
@@ -72,6 +78,8 @@ export interface Highlight {
 export interface GeneratedClip {
   id: string;
   path: string;
+  /** When STORAGE_MODE=s3, key used to fetch clip if local path is missing. */
+  storageClipKey?: string;
   url: string;
   startSec: number;
   endSec: number;
@@ -107,6 +115,16 @@ export interface AiUsageMetrics {
   openai: OpenAiUsageMetrics;
   gemini: GeminiUsageMetrics;
   totalTokens: number;
+}
+
+export type PipelineLogLevel = "info" | "warn" | "error";
+
+export interface PipelineLogEntry {
+  ts: string;
+  level: PipelineLogLevel;
+  stage: string;
+  message: string;
+  detail?: string;
 }
 
 export interface JobMetrics {
@@ -146,6 +164,9 @@ export type AgentToolName =
   | "build_reel"
   | "explain_clip";
 
+/** User preference for max highlight clips produced. `null` = unlimited (subject to dedupe/normalization). */
+export type HighlightClipLimitChoice = 5 | 10 | 15 | null;
+
 export interface ConversationRecord {
   id: string;
   title: string;
@@ -155,6 +176,7 @@ export interface ConversationRecord {
   playerFocus?: PlayerFocusSpec | null;
   /** Saved default processing presets (conversation `player_focus_json.processingPresets`). */
   processingPresets?: ProcessingPresetsState | null;
+  highlightClipLimit?: HighlightClipLimitChoice;
   archivedAt: string | null;
   createdAt: string;
   updatedAt: string;
@@ -208,6 +230,9 @@ export interface JobState {
   highlights?: Highlight[];
   clips?: GeneratedClip[];
   metrics: JobMetrics;
+  pipelineLogs?: PipelineLogEntry[];
+  /** Max clips after ranking; omit to use MAX_HIGHLIGHTS_FINAL env default. Use 0 for unlimited (no slice after sort). */
+  maxHighlightsFinal?: number;
   createdAt: string;
   updatedAt: string;
 }
