@@ -1,6 +1,7 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { copyFile, mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { Readable } from "node:stream";
 import type { Readable as NodeReadable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -48,6 +49,46 @@ export function clipObjectStorageKey(jobId: string, clipId: string): string {
   return `clips/${jobId}/${clipId}.mp4`;
 }
 
+async function mirrorInputVideoToObjectStorage(
+  jobId: string,
+  localPath: string,
+  extension: string,
+): Promise<{ path: string; key: string }> {
+  const key = `inputs/${jobId}/input${extension}`;
+  const s3 = createS3Client();
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: appConfig.storage.bucket,
+      Key: key,
+      Body: createReadStream(localPath),
+      ContentType: "video/mp4",
+    }),
+  );
+  return { path: localPath, key };
+}
+
+/** Stream a Web ReadableStream to disk (avoids loading multi-GB uploads into RAM). */
+export async function saveInputVideoStream(
+  jobId: string,
+  fileName: string,
+  body: ReadableStream<Uint8Array>,
+): Promise<{ path: string; key?: string }> {
+  const extension = path.extname(fileName) || ".mp4";
+  const jobDir = durableJobMediaDir(jobId);
+  const localPath = path.join(jobDir, `input${extension}`);
+  await mkdir(jobDir, { recursive: true });
+  await pipeline(
+    Readable.fromWeb(body as Parameters<typeof Readable.fromWeb>[0]),
+    createWriteStream(localPath),
+  );
+
+  if (!isObjectStorageEnabled()) {
+    return { path: localPath };
+  }
+
+  return mirrorInputVideoToObjectStorage(jobId, localPath, extension);
+}
+
 export async function saveInputVideo(jobId: string, fileName: string, bytes: Buffer): Promise<{ path: string; key?: string }> {
   const extension = path.extname(fileName) || ".mp4";
   const jobDir = durableJobMediaDir(jobId);
@@ -59,17 +100,7 @@ export async function saveInputVideo(jobId: string, fileName: string, bytes: Buf
     return { path: localPath };
   }
 
-  const key = `inputs/${jobId}/input${extension}`;
-  const s3 = createS3Client();
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: appConfig.storage.bucket,
-      Key: key,
-      Body: bytes,
-      ContentType: "video/mp4",
-    }),
-  );
-  return { path: localPath, key };
+  return mirrorInputVideoToObjectStorage(jobId, localPath, extension);
 }
 
 export async function promoteCutClipsToDurable(jobId: string, clips: GeneratedClip[]): Promise<GeneratedClip[]> {

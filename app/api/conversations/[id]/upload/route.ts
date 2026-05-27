@@ -5,9 +5,11 @@ import {
   getConversation,
   updateConversation,
 } from "@/lib/conversations";
-import { pendingConversationJobId, saveInputVideo } from "@/lib/storage";
+import { pendingConversationJobId, saveInputVideoStream } from "@/lib/storage";
 
 export const runtime = "nodejs";
+/** Large game films can take several minutes to stream to disk. */
+export const maxDuration = 900;
 
 export async function POST(
   request: Request,
@@ -26,8 +28,11 @@ export async function POST(
       return NextResponse.json({ error: "Expected a video file in form field `video`." }, { status: 400 });
     }
 
-    const bytes = Buffer.from(await file.arrayBuffer());
-    const stored = await saveInputVideo(pendingConversationJobId(id), file.name, bytes);
+    const stored = await saveInputVideoStream(
+      pendingConversationJobId(id),
+      file.name,
+      file.stream(),
+    );
     await updateConversation(id, {
       pendingInputPath: stored.path,
     });

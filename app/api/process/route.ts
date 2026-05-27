@@ -8,13 +8,14 @@ import { createJob, setJobError, updateJob, waitForJobPersistence } from "@/lib/
 import { clipLimitChoiceToJobField, normalizeHighlightClipLimitFormValue } from "@/lib/highlightCap";
 import { runPipeline } from "@/lib/pipeline";
 import { enqueuePipelineJob, isQueueEnabled } from "@/lib/queue";
-import { saveInputVideo } from "@/lib/storage";
+import { saveInputVideoStream } from "@/lib/storage";
 import { randomUUID } from "node:crypto";
 import { NextResponse } from "next/server";
 
 import type { ProcessingPresetsState } from "@/lib/types";
 
 export const runtime = "nodejs";
+export const maxDuration = 900;
 
 export async function POST(request: Request) {
   try {
@@ -28,11 +29,9 @@ export async function POST(request: Request) {
     }
 
     const jobId = randomUUID();
-    const bytes = await file.arrayBuffer();
-    const inputBuffer = Buffer.from(bytes);
 
     // Keep local copy for FFmpeg worker path; optionally mirror to object storage.
-    const stored = await saveInputVideo(jobId, file.name, inputBuffer);
+    const stored = await saveInputVideoStream(jobId, file.name, file.stream());
 
     const userPrompt =
       typeof promptInput === "string" && promptInput.trim().length > 0 ? promptInput.trim() : undefined;

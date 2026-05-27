@@ -2,11 +2,12 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, Loader2, Pencil, Play, Send, X } from "lucide-react";
+import { ArrowUp, ChevronDown, Loader2, Pencil, Play, X } from "lucide-react";
 
 import { derivePipelineTasksFromJob } from "@/lib/pipeline/liveTaskTimeline";
 
 import { parseSseStream } from "@/lib/client/sse";
+import { formatFileSize, uploadVideoFile } from "@/lib/client/uploadVideo";
 import {
   applyPresetBlockToComposerText,
   buildCombinedPrompt,
@@ -64,6 +65,7 @@ export function ConversationWorkspace({
   const [job, setJob] = useState<JobState | null>(null);
 
   const [input, setInput] = useState("");
+  const composerTextareaRef = useRef<HTMLTextAreaElement>(null);
   const lastInjectedPresetBlockRef = useRef<string | null>(null);
   const [presetComposerHint, setPresetComposerHint] = useState<string | null>(
     null,
@@ -73,6 +75,7 @@ export function ConversationWorkspace({
   const [streamingAssistant, setStreamingAssistant] = useState("");
 
   const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [pageError, setPageError] = useState<string | null>(null);
 
   const [presetSelectedIds, setPresetSelectedIds] = useState<string[]>([]);
@@ -104,7 +107,7 @@ export function ConversationWorkspace({
   const [editingDraft, setEditingDraft] = useState("");
   const [messageEditBusy, setMessageEditBusy] = useState(false);
 
-  const loadConversation = useCallback(async () => {
+  const loadConversation = useCallback(async (): Promise<ConversationRecord | null> => {
     const res = await fetch(`/api/conversations/${conversationId}`);
     const payload = (await res.json()) as {
       conversation?: ConversationRecord;
@@ -115,7 +118,7 @@ export function ConversationWorkspace({
     };
     if (!res.ok) {
       setPageError(payload.error ?? "Could not load conversation.");
-      return;
+      return null;
     }
     setPageError(null);
     setConversation(payload.conversation ?? null);
@@ -151,6 +154,7 @@ export function ConversationWorkspace({
         ? placeholders.jerseyColor
         : "",
     );
+    return payload.conversation ?? null;
   }, [conversationId]);
 
   const onHighlightClipLimitChange = useCallback(
@@ -408,24 +412,55 @@ export function ConversationWorkspace({
       return;
     }
     setUploadBusy(true);
+    setUploadProgress(0);
     setChatError(null);
     try {
-      const formData = new FormData();
-      formData.set("video", file);
-      const res = await fetch(`/api/conversations/${conversationId}/upload`, {
-        method: "POST",
-        body: formData,
-      });
-      const payload = (await res.json()) as { error?: string };
-      if (!res.ok) {
-        setChatError(payload.error ?? "Upload failed.");
+      const result = await uploadVideoFile(
+        `/api/conversations/${conversationId}/upload`,
+        file,
+        {
+          onProgress: setUploadProgress,
+          timeoutMs: 30 * 60 * 1000,
+        },
+      );
+      if (!result.ok) {
+        setChatError(result.payload.error ?? "Upload failed.");
         return;
       }
       await loadConversation();
+    } catch (error) {
+      const refreshed = await loadConversation();
+      if (refreshed?.pendingInputPath) {
+        setChatError(null);
+        return;
+      }
+      const message =
+        error instanceof Error
+          ? error.message
+          : "Upload failed. Large videos (1 GB+) can take several minutes — try again and wait for the progress bar.";
+      setChatError(
+        `${message} (${formatFileSize(file.size)}). If this keeps failing, restart \`yarn dev\` and upload once without switching conversations.`,
+      );
     } finally {
       setUploadBusy(false);
+      setUploadProgress(null);
     }
   };
+
+  const syncComposerHeight = useCallback(() => {
+    const el = composerTextareaRef.current;
+    if (!el) {
+      return;
+    }
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+  }, []);
+
+  useEffect(() => {
+    syncComposerHeight();
+  }, [input, syncComposerHeight]);
+
+  const canSendComposer = input.trim().length > 0 && !isSending;
 
   const onSend = async () => {
     const trimmed = input.trim();
@@ -615,8 +650,20 @@ export function ConversationWorkspace({
                     void onUploadVideo(e.target.files?.[0] ?? null)
                   }
                 />
-                {uploadBusy ? "Uploading…" : "Upload video"}
+                {uploadBusy
+                  ? uploadProgress != null && uploadProgress > 0
+                    ? `Uploading ${uploadProgress}%…`
+                    : "Uploading…"
+                  : "Upload video"}
               </label>
+              {uploadBusy && uploadProgress != null && uploadProgress > 0 && (
+                <div className="h-1.5 w-32 overflow-hidden rounded-full bg-zinc-800">
+                  <div
+                    className="h-full rounded-full bg-emerald-600 transition-[width] duration-300"
+                    style={{ width: `${uploadProgress}%` }}
+                  />
+                </div>
+              )}
               {conversation?.pendingInputPath && (
                 <span className="text-xs text-emerald-300">
                   Video ready — ask the agent to start processing.
@@ -666,7 +713,8 @@ export function ConversationWorkspace({
               fields when a template needs them, then click{" "}
               <strong className="text-zinc-400">Confirm</strong>. The merged
               prompt text appears in your message box—edit anything you want,
-              then <strong className="text-zinc-400">Send</strong> to talk to
+              then use the <strong className="text-zinc-400">send arrow</strong>{" "}
+              to talk to
               the agent or start processing. Details:{" "}
               <span className="font-mono text-zinc-500">
                 docs/DEFAULT_PROCESSING_PRESETS.md
@@ -917,7 +965,7 @@ export function ConversationWorkspace({
           </div>
         </div>
 
-        <div className="border-t border-zinc-800 p-3">
+        <div className="border-t border-zinc-800 px-4 py-3">
           {presetComposerHint && (
             <p className="mb-2 text-xs text-emerald-400/90" role="status">
               {presetComposerHint}
@@ -928,9 +976,11 @@ export function ConversationWorkspace({
               {chatError}
             </div>
           )}
-          <div className="flex gap-2">
+          <div className="relative rounded-[26px] border border-zinc-700/90 bg-zinc-900 shadow-[0_0_0_1px_rgba(255,255,255,0.03)] transition-colors focus-within:border-zinc-600">
             <textarea
-              className="min-h-[44px] flex-1 resize-none rounded-xl border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm outline-none focus:border-zinc-600"
+              ref={composerTextareaRef}
+              rows={1}
+              className="block max-h-[200px] min-h-[52px] w-full resize-none overflow-y-auto bg-transparent px-4 pb-11 pt-3.5 text-[15px] leading-relaxed text-zinc-100 outline-none placeholder:text-zinc-500"
               placeholder="Ask for highlights, refinements, explanations, or reels…"
               value={input}
               onChange={(e) => setInput(e.target.value)}
@@ -940,16 +990,23 @@ export function ConversationWorkspace({
                   void onSend();
                 }
               }}
+              aria-label="Message"
             />
-            <button
-              type="button"
-              onClick={() => void onSend()}
-              disabled={isSending}
-              className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-60"
-            >
-              <Send className="h-4 w-4" />
-              Send
-            </button>
+            <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-end px-2 pb-2">
+              <button
+                type="button"
+                onClick={() => void onSend()}
+                disabled={!canSendComposer}
+                aria-label="Send message"
+                className="pointer-events-auto flex h-8 w-8 items-center justify-center rounded-full bg-white text-zinc-950 transition hover:bg-zinc-200 disabled:cursor-not-allowed disabled:bg-zinc-700 disabled:text-zinc-500"
+              >
+                {isSending ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <ArrowUp className="h-4 w-4 stroke-[2.5]" />
+                )}
+              </button>
+            </div>
           </div>
         </div>
       </section>

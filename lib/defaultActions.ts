@@ -183,10 +183,10 @@ export function buildCombinedPrompt(
   const blocks = sorted.map((id) => {
     const definition = PROMPT_LOOKUP[id];
     const body = applyPresetPlaceholders(definition.promptTemplate, placeholders ?? null, id);
-    return [`### ${definition.title}`, body.trim()].join("\n");
+    return [`${definition.title}`, body.trim()].join("\n");
   });
 
-  return ["── Default processing presets ──", "", ...blocks].join("\n");
+  return [...blocks].join("\n");
 }
 
 /** Same separator as server-side merge — keep in sync when stripping preset blocks from the chat composer. */
