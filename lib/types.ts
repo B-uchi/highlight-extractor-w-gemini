@@ -1,238 +1,152 @@
-export type JobStage =
-  | "queued"
-  | "extracting_audio"
-  | "chunking_audio"
-  | "transcribing"
-  | "ranking"
-  | "cutting"
+// ── Conversation ──────────────────────────────────────────────────────────────
+
+export type ConversationStatus = "awaiting_video" | "active" | "archived";
+
+export interface Conversation {
+  id: string;
+  title: string;
+  status: ConversationStatus;
+  r2_video_key: string | null;
+  video_filename: string | null;
+  video_duration_secs: number | null;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+}
+
+// ── Video chunks (per-chunk Gemini file tracking) ─────────────────────────────
+
+export interface VideoChunk {
+  id: string;
+  conversation_id: string;
+  chunk_index: number;
+  start_sec: number;
+  end_sec: number;
+  gemini_file_id: string | null;
+  gemini_expires_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// ── Messages ──────────────────────────────────────────────────────────────────
+
+export type MessageRole = "user" | "assistant";
+
+export interface Message {
+  id: string;
+  conversation_id: string;
+  role: MessageRole;
+  content: string;
+  job_id: string | null;
+  created_at: string;
+}
+
+// ── Jobs ──────────────────────────────────────────────────────────────────────
+
+export type JobMode =
+  | "action_extraction"
+  | "highlight_compilation_individual"
+  | "highlight_compilation_team";
+
+export type JobStatus =
+  | "pending"
+  | "extracting_target"
+  | "analyzing"
+  | "extracting_clips"
+  | "stitching"
+  | "done"
+  | "error"
+  | "unsupported";
+
+export interface Job {
+  id: string;
+  conversation_id: string;
+  message_id: string;
+  mode: JobMode;
+  status: JobStatus;
+  prompt: string;
+  extracted_target: string | null;
+  jersey_number: string | null;
+  jersey_color: string | null;
+  team_name: string | null;
+  clip_limit: number | null;
+  follow_up_secs: number | null;
+  include_audio: boolean;
+  clips_total: number | null;
+  clips_done: number;
+  compilation_r2_key: string | null;
+  compilation_r2_url: string | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// ── Clips ─────────────────────────────────────────────────────────────────────
+
+export interface Clip {
+  id: string;
+  job_id: string;
+  conversation_id: string;
+  title: string;
+  description: string | null;
+  start_sec: number;
+  end_sec: number;
+  follow_up_end_sec: number | null;
+  rank: number;
+  jersey_number: string | null;
+  jersey_color: string | null;
+  r2_clip_key: string | null;
+  r2_clip_url: string | null;
+  created_at: string;
+}
+
+// ── Gemini structured response ────────────────────────────────────────────────
+
+export interface GeminiClipResult {
+  title: string;
+  description: string;
+  start_sec: number;
+  end_sec: number;
+  rank: number;
+  confidence: number;
+  jerseyNumber?: string | null;
+  jerseyColor?: string | null;
+}
+
+export interface PreStepResult {
+  mode: JobMode | "unsupported";
+  target: string;
+  jerseyNumber: string | null;
+  jerseyColor: string | null;
+  teamName: string | null;
+  includeAudio: boolean;
+  supported: boolean;
+}
+
+// ── Upload progress (streamed JSON lines) ─────────────────────────────────────
+
+export type UploadProgressStep =
+  | "preprocessing"
+  | "uploading_r2"
+  | "uploading_gemini"
   | "done"
   | "error";
 
-/** Optional substitutions for templated preset copy (dashboard + agent overlays). */
-export interface ProcessingPresetsPlaceholders {
-  /** Replaces `Triple Threat Athletics` in the team-based preset when set */
-  teamHighlightName?: string;
-  primaryPlayerName?: string;
-  /** Fills `#[Number]` / `[Jersey Number]` in individual-player preset */
-  primaryJerseyNumber?: string;
-  /** Fills `[Team Name]` in individual-player preset */
-  individualTeamName?: string;
-  /** Fills `[jersey color]` in individual-player preset */
-  jerseyColor?: string;
-}
-
-/** Multi-select checklist + placeholder values mirrored onto jobs when processing starts. */
-export interface ProcessingPresetsState {
-  selectedIds: string[];
-  placeholders?: ProcessingPresetsPlaceholders;
-}
-
-/** Structured roster row for player-focused highlight extraction (used in prompts + job state). */
-export interface PlayerRosterEntry {
-  jerseyNumber: string;
-  displayName?: string;
-  photoUrl?: string;
-  height?: string;
-  buildProfile?: string;
-  accessoryNotes?: string;
-}
-
-/**
- * Grounding spec for team/player priors. Does not enable true full-game tracking by itself
- * (requires CV / tracking — see `next.md` Phase 2).
- */
-export interface PlayerFocusSpec {
-  teamAName: string;
-  jerseyColors: string[];
-  /** e.g. "scan full video…" — user narrative; model still sees chunks only. */
-  identificationPrompt?: string;
-  roster?: PlayerRosterEntry[];
-  primaryTarget?: {
-    jerseyNumber: string;
-    isolationPrompt?: string;
-  };
-}
-
-export interface Highlight {
-  startSec: number;
-  endSec: number;
-  title: string;
-  reason: string;
-  score: number;
-  eventType?: string;
-  confidence?: number;
-  evidence?: string[];
-  category?: string;
-  tags?: string[];
-  transcriptQuote?: string;
-  keyFrameSec?: number;
-  audioPeakDb?: number;
-  /** When targeting is enabled — only when visibly grounded */
-  playerJersey?: string;
-  playerName?: string;
-  teamTag?: string;
-  /** Short honesty note about visibility / occlusion in this chunk */
-  visibilityNote?: string;
-}
-
-export interface GeneratedClip {
-  id: string;
-  path: string;
-  /** When STORAGE_MODE=s3, key used to fetch clip if local path is missing. */
-  storageClipKey?: string;
-  url: string;
-  startSec: number;
-  endSec: number;
-  title: string;
-  score: number;
-  eventType?: string;
-  category?: string;
-}
-
-export interface TranscriptSegment {
-  start: number;
-  end: number;
-  text: string;
-}
-
-export interface TranscriptResult {
-  fullText: string;
-  segments: TranscriptSegment[];
-}
-
-export interface OpenAiUsageMetrics {
-  transcriptionSeconds: number;
-}
-
-export interface GeminiUsageMetrics {
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-  videoSeconds: number;
-}
-
-export interface AiUsageMetrics {
-  openai: OpenAiUsageMetrics;
-  gemini: GeminiUsageMetrics;
-  totalTokens: number;
-}
-
-export type PipelineLogLevel = "info" | "warn" | "error";
-
-export interface PipelineLogEntry {
-  ts: string;
-  level: PipelineLogLevel;
-  stage: string;
+export interface UploadProgressEvent {
+  step: UploadProgressStep;
   message: string;
-  detail?: string;
-}
-
-export interface JobMetrics {
-  startedAt: string;
-  finishedAt?: string;
-  durationMs?: number;
-  ai: AiUsageMetrics;
-  costUsdEstimate?: number;
-}
-
-export interface CandidateWindow {
-  startSec: number;
-  endSec: number;
-  transcriptScore: number;
-  audioScore: number;
-  reasons: string[];
-}
-
-export type ChatRole = "user" | "assistant" | "system" | "tool";
-
-export type AgentTaskType =
-  | "upload"
-  | "transcribe"
-  | "rank"
-  | "cut"
-  | "refine"
-  | "build_reel"
-  | "explain";
-
-export type AgentTaskStatus = "pending" | "running" | "done" | "error";
-
-export type AgentToolName =
-  | "start_processing"
-  | "get_job_status"
-  | "list_highlights"
-  | "refine_highlights"
-  | "build_reel"
-  | "explain_clip";
-
-/** User preference for max highlight clips produced. `null` = unlimited (subject to dedupe/normalization). */
-export type HighlightClipLimitChoice = 5 | 10 | 15 | null;
-
-export interface ConversationRecord {
-  id: string;
-  title: string;
-  activeJobId: string | null;
-  pendingInputPath: string | null;
-  /** Pending structured targeting applied on next start_processing. */
-  playerFocus?: PlayerFocusSpec | null;
-  /** Saved default processing presets (conversation `player_focus_json.processingPresets`). */
-  processingPresets?: ProcessingPresetsState | null;
-  highlightClipLimit?: HighlightClipLimitChoice;
-  archivedAt: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface ChatMessageRecord {
-  id: string;
-  conversationId: string;
-  role: ChatRole;
-  content: string;
-  metadata: Record<string, unknown> | null;
-  createdAt: string;
-}
-
-export interface AgentTaskRecord {
-  id: string;
-  conversationId: string;
-  jobId: string | null;
-  type: AgentTaskType;
-  status: AgentTaskStatus;
-  progress: number;
-  label: string;
-  detail: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface JobState {
-  id: string;
-  stage: JobStage;
-  progress: number;
-  message: string;
+  chunk?: number;
+  totalChunks?: number;
   error?: string;
-  inputPath: string;
-  /** When set, pipeline updates agent task rows for this conversation. */
-  conversationId?: string;
-  /** Last pipeline stage before terminal error (for task UI). */
-  failedAtStage?: JobStage;
-  inputHash?: string;
-  storageInputKey?: string;
-  userPrompt?: string;
-  effectivePrompt?: string;
-  category?: string;
-  /** Same as conversation targeting; stored on the job for ranking/refine + cache keys. */
-  playerFocus?: PlayerFocusSpec;
-  /** Preset bundle applied when this job was created (inspectable; refine uses merged freeform prompt). */
-  processingPresets?: ProcessingPresetsState | null;
-  transcriptPath?: string;
-  highlightsPath?: string;
-  candidatesPath?: string;
-  highlights?: Highlight[];
-  clips?: GeneratedClip[];
-  metrics: JobMetrics;
-  pipelineLogs?: PipelineLogEntry[];
-  /** Max clips after ranking; omit to use MAX_HIGHLIGHTS_FINAL env default. Use 0 for unlimited (no slice after sort). */
-  maxHighlightsFinal?: number;
-  createdAt: string;
-  updatedAt: string;
+}
+
+// ── API response shapes ───────────────────────────────────────────────────────
+
+export interface ConversationDetail extends Conversation {
+  messages: MessageWithClips[];
+}
+
+export interface MessageWithClips extends Message {
+  clips?: Clip[];
+  job?: Job | null;
 }

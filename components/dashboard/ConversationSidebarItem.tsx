@@ -1,17 +1,17 @@
 "use client";
 
 import Link from "next/link";
-import { Archive, ArchiveRestore, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, MoreHorizontal, Pencil } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
-import type { ConversationRecord } from "@/lib/types";
+import type { Conversation } from "@/lib/types";
+import { relativeTime } from "@/lib/format";
 
-type ConversationSidebarItemProps = {
-  conversation: ConversationRecord;
+type Props = {
+  conversation: Conversation;
   active: boolean;
   archived?: boolean;
   onUpdated: () => void;
-  onDeleted: (id: string) => void;
   onNavigate?: () => void;
 };
 
@@ -20,9 +20,8 @@ export function ConversationSidebarItem({
   active,
   archived = false,
   onUpdated,
-  onDeleted,
   onNavigate,
-}: ConversationSidebarItemProps) {
+}: Props) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [isRenaming, setIsRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(conversation.title);
@@ -31,22 +30,18 @@ export function ConversationSidebarItem({
   const renameInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    queueMicrotask(() => {
-      setRenameValue(conversation.title);
-    });
+    setRenameValue(conversation.title);
   }, [conversation.title]);
 
   useEffect(() => {
-    if (!menuOpen) {
-      return;
-    }
-    const onPointerDown = (event: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
+    if (!menuOpen) return;
+    const handler = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenuOpen(false);
       }
     };
-    document.addEventListener("mousedown", onPointerDown);
-    return () => document.removeEventListener("mousedown", onPointerDown);
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
   }, [menuOpen]);
 
   useEffect(() => {
@@ -56,7 +51,7 @@ export function ConversationSidebarItem({
     }
   }, [isRenaming]);
 
-  const patchConversation = async (body: { title?: string; archived?: boolean }) => {
+  const patch = async (body: { title?: string; archived?: boolean }) => {
     setBusy(true);
     try {
       const res = await fetch(`/api/conversations/${conversation.id}`, {
@@ -64,9 +59,7 @@ export function ConversationSidebarItem({
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
       });
-      if (!res.ok) {
-        return false;
-      }
+      if (!res.ok) return false;
       onUpdated();
       return true;
     } finally {
@@ -81,58 +74,29 @@ export function ConversationSidebarItem({
       setRenameValue(conversation.title);
       return;
     }
-    const ok = await patchConversation({ title });
-    if (ok) {
-      setIsRenaming(false);
-    }
+    const ok = await patch({ title });
+    if (ok) setIsRenaming(false);
   };
 
   const onArchiveToggle = async () => {
     setMenuOpen(false);
-    await patchConversation({ archived: !archived });
-  };
-
-  const onDelete = async () => {
-    setMenuOpen(false);
-    const confirmed = window.confirm(
-      `Delete "${conversation.title}"? This removes the conversation and its messages permanently.`,
-    );
-    if (!confirmed) {
-      return;
-    }
-    setBusy(true);
-    try {
-      const res = await fetch(`/api/conversations/${conversation.id}`, { method: "DELETE" });
-      if (res.ok) {
-        onDeleted(conversation.id);
-      }
-    } finally {
-      setBusy(false);
-    }
+    await patch({ archived: !archived });
   };
 
   return (
-    <div
-      className={[
-        "group relative rounded-lg",
-        active ? "bg-zinc-900" : "hover:bg-zinc-900/70",
-      ].join(" ")}
-    >
+    <div className={["group relative rounded-lg", active ? "bg-zinc-900" : "hover:bg-zinc-900/70"].join(" ")}>
       {isRenaming ? (
         <form
           className="px-3 py-2"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void onRenameSubmit();
-          }}
+          onSubmit={(e) => { e.preventDefault(); void onRenameSubmit(); }}
         >
           <input
             ref={renameInputRef}
             value={renameValue}
-            onChange={(event) => setRenameValue(event.target.value)}
+            onChange={(e) => setRenameValue(e.target.value)}
             onBlur={() => void onRenameSubmit()}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
                 setIsRenaming(false);
                 setRenameValue(conversation.title);
               }
@@ -146,27 +110,20 @@ export function ConversationSidebarItem({
           <Link
             href={`/dashboard/${conversation.id}`}
             onClick={onNavigate}
-            className={[
-              "block px-3 py-2 pr-9 text-sm",
-              active ? "text-zinc-50" : "text-zinc-300",
-            ].join(" ")}
+            className={["block px-3 py-2 pr-9 text-sm", active ? "text-zinc-50" : "text-zinc-300"].join(" ")}
           >
             <span className="line-clamp-2 font-medium">{conversation.title}</span>
-            <span className="mt-1 block text-[11px] text-zinc-500">
-              {new Date(conversation.updatedAt).toLocaleString()}
+            <span className="mt-0.5 block text-[11px] text-zinc-500">
+              {relativeTime(conversation.updated_at)}
             </span>
           </Link>
 
           <div ref={menuRef} className="absolute right-1 top-1">
             <button
               type="button"
-              aria-label="Conversation options"
+              aria-label="Options"
               disabled={busy}
-              onClick={(event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                setMenuOpen((open) => !open);
-              }}
+              onClick={(e) => { e.preventDefault(); e.stopPropagation(); setMenuOpen((o) => !o); }}
               className={[
                 "rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200",
                 menuOpen ? "opacity-100" : "opacity-0 group-hover:opacity-100 focus:opacity-100",
@@ -180,10 +137,7 @@ export function ConversationSidebarItem({
                 <button
                   type="button"
                   className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-zinc-200 hover:bg-zinc-900"
-                  onClick={() => {
-                    setMenuOpen(false);
-                    setIsRenaming(true);
-                  }}
+                  onClick={() => { setMenuOpen(false); setIsRenaming(true); }}
                 >
                   <Pencil className="h-3.5 w-3.5" />
                   Rename
@@ -194,24 +148,10 @@ export function ConversationSidebarItem({
                   onClick={() => void onArchiveToggle()}
                 >
                   {archived ? (
-                    <>
-                      <ArchiveRestore className="h-3.5 w-3.5" />
-                      Unarchive
-                    </>
+                    <><ArchiveRestore className="h-3.5 w-3.5" />Unarchive</>
                   ) : (
-                    <>
-                      <Archive className="h-3.5 w-3.5" />
-                      Archive
-                    </>
+                    <><Archive className="h-3.5 w-3.5" />Archive</>
                   )}
-                </button>
-                <button
-                  type="button"
-                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-red-400 hover:bg-zinc-900"
-                  onClick={() => void onDelete()}
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                  Delete
                 </button>
               </div>
             )}

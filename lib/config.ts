@@ -1,54 +1,43 @@
-import path from "node:path";
+// Token budget math:
+// At slowdown=S and fps=F, a chunk of N original seconds uses:
+//   N × S × F × 258 tokens
+// Stay under 900K tokens (90% of 1M context):
+//   N ≤ 900_000 / (S × F × 258)
+// Default S=4, F=3 → N ≤ 900_000 / (4 × 3 × 258) = 290s ≈ 4.8 min per chunk
+// For a 90-min broadcast: ~18 chunks (analysed in parallel batches of 3)
+
+const slowdown = Number(process.env.GEMINI_VIDEO_SLOWDOWN ?? 4);
+const analysisFps = Number(process.env.GEMINI_ANALYSIS_FPS ?? 3);
+const autoChunkSec = Math.floor(900_000 / (slowdown * analysisFps * 258));
 
 export const appConfig = {
-  pipeline: {
-    audioChunkDurationSec: Number(process.env.AUDIO_CHUNK_DURATION_SEC ?? 600),
-    videoLongThresholdSec: Number(process.env.VIDEO_LONG_THRESHOLD_SEC ?? 1_200),
-    videoChunkDurationSec: Number(process.env.VIDEO_CHUNK_DURATION_SEC ?? 900),
-    geminiConcurrency: Number(process.env.GEMINI_CONCURRENCY ?? 4),
-    whisperConcurrency: Number(process.env.WHISPER_CONCURRENCY ?? 4),
-    maxHighlightsFinal: Number(process.env.MAX_HIGHLIGHTS_FINAL ?? 15),
-    /** When true, skip FFmpeg audio extract + Whisper; ranking uses visual-only cues (optional empty transcript segments). */
-    skipTranscription: process.env.SKIP_TRANSCRIPTION === "true",
-    budgetMaxTotalTokens: Number(process.env.MAX_JOB_TOTAL_TOKENS ?? 300_000),
-  },
-  clip: {
-    defaultPrePadSec: Number(process.env.DEFAULT_PRE_PAD_SEC ?? 1),
-    defaultPostPadSec: Number(process.env.DEFAULT_POST_PAD_SEC ?? 2),
-  },
-  queue: {
-    enabled: process.env.USE_QUEUE === "true",
-    redisUrl: process.env.REDIS_URL ?? "",
-    jobQueueName: process.env.JOB_QUEUE_NAME ?? "video-highlights-jobs",
-    workerConcurrency: Number(process.env.WORKER_CONCURRENCY ?? 2),
-  },
-  storage: {
-    mode: process.env.STORAGE_MODE ?? "local",
-    basePublicUrl: process.env.STORAGE_BASE_PUBLIC_URL ?? "",
-    bucket: process.env.STORAGE_BUCKET ?? "",
-    endpoint: process.env.STORAGE_ENDPOINT ?? "",
-    region: process.env.STORAGE_REGION ?? "auto",
-    accessKeyId: process.env.STORAGE_ACCESS_KEY_ID ?? "",
-    secretAccessKey: process.env.STORAGE_SECRET_ACCESS_KEY ?? "",
-    /** Durable local media root (survives tmp cleanup). Resolved relative to cwd. */
-    dataDir: path.resolve(process.cwd(), process.env.DATA_DIR?.trim() || "storage"),
-  },
-  jobs: {
-    useDatabase: process.env.USE_DATABASE_JOBS === "true",
-    databaseUrl: process.env.DATABASE_URL ?? "",
-  },
-  cv: {
-    enabled: process.env.ENABLE_CV_WORKER === "true",
-    baseUrl: process.env.CV_WORKER_URL ?? "http://localhost:8000",
-  },
   gemini: {
-    /**
-     * @google/genai default ~10s is too tight for uploads + generateContent over slow networks.
-     * Whole-request timeout (ms), including connects.
-     */
-    httpTimeoutMs: Math.max(
-      10_000,
-      Number(process.env.GEMINI_HTTP_TIMEOUT_MS ?? 180_000),
-    ),
+    httpTimeoutMs: Math.max(10_000, Number(process.env.GEMINI_HTTP_TIMEOUT_MS ?? 300_000)),
+    // Max ORIGINAL-time seconds per chunk. Auto-calculated from token budget unless overridden.
+    chunkDurationSec: Number(process.env.GEMINI_CHUNK_DURATION_SEC ?? autoChunkSec),
+    analysisParallelism: Number(process.env.GEMINI_ANALYSIS_PARALLELISM ?? 3),
+    // Slow-motion factor applied to each chunk before Gemini upload.
+    // Gives Gemini denser frame coverage of fast actions (dunks, blocks, etc.).
+    // Set to 1 to disable. Timestamps from Gemini are divided by this factor
+    // to recover real video time.
+    videoSlowdownFactor: slowdown,
+    // FPS passed to Gemini's videoMetadata. Lower than 10 to stay within token budget
+    // when slowdown > 1.
+    analysisFps,
+  },
+  r2: {
+    accountId: process.env.R2_ACCOUNT_ID ?? "",
+    accessKeyId: process.env.R2_ACCESS_KEY_ID ?? "",
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY ?? "",
+    bucket: process.env.R2_BUCKET_NAME ?? "",
+    presignExpiresIn: Number(process.env.R2_PRESIGN_EXPIRES_SEC ?? 3600),
+  },
+  supabase: {
+    url: process.env.SUPABASE_URL ?? "",
+    anonKey: process.env.SUPABASE_ANON_KEY ?? "",
+    serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY ?? "",
+  },
+  cron: {
+    secret: process.env.CRON_SECRET ?? "",
   },
 };

@@ -1,177 +1,145 @@
 import { createReadStream, createWriteStream } from "node:fs";
-import { copyFile, mkdir, writeFile } from "node:fs/promises";
+import { mkdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
-import type { Readable as NodeReadable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-import { GetObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import {
+  CompleteMultipartUploadCommand,
+  CreateMultipartUploadCommand,
+  GetObjectCommand,
+  PutObjectCommand,
+  S3Client,
+  UploadPartCommand,
+} from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 import { appConfig } from "@/lib/config";
-import type { GeneratedClip } from "@/lib/types";
 
-function createS3Client(): S3Client {
+function createR2Client(): S3Client {
+  const { accountId, accessKeyId, secretAccessKey } = appConfig.r2;
+  if (!accountId || !accessKeyId || !secretAccessKey) {
+    throw new Error("R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY must be set.");
+  }
   return new S3Client({
-    region: appConfig.storage.region,
-    endpoint: appConfig.storage.endpoint || undefined,
-    forcePathStyle: true,
-    credentials:
-      appConfig.storage.accessKeyId && appConfig.storage.secretAccessKey
-        ? {
-            accessKeyId: appConfig.storage.accessKeyId,
-            secretAccessKey: appConfig.storage.secretAccessKey,
-          }
-        : undefined,
+    region: "auto",
+    endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+    credentials: { accessKeyId, secretAccessKey },
   });
 }
 
-export function isObjectStorageEnabled(): boolean {
-  return appConfig.storage.mode === "s3";
+export function tmpDir(conversationId: string): string {
+  return path.join(process.cwd(), "tmp", conversationId);
 }
 
-/** Temp working dir for FFmpeg intermediates (transcript chunks, proxies). */
-export function localJobDir(jobId: string): string {
-  return path.join(process.cwd(), "tmp", jobId);
+export async function ensureTmpDir(conversationId: string): Promise<string> {
+  const dir = tmpDir(conversationId);
+  await mkdir(dir, { recursive: true });
+  return dir;
 }
 
-/** Durable on-disk assets for reloadable playback (survives tmp cleanup). */
-export function durableJobMediaDir(jobId: string): string {
-  return path.join(appConfig.storage.dataDir, "jobs", jobId);
-}
-
-/** Stable pseudo job folder for a conversation's pending upload (before a real job id exists). */
-export function pendingConversationJobId(conversationId: string): string {
-  return `conv-${conversationId}`;
-}
-
-export function clipObjectStorageKey(jobId: string, clipId: string): string {
-  return `clips/${jobId}/${clipId}.mp4`;
-}
-
-async function mirrorInputVideoToObjectStorage(
-  jobId: string,
-  localPath: string,
-  extension: string,
-): Promise<{ path: string; key: string }> {
-  const key = `inputs/${jobId}/input${extension}`;
-  const s3 = createS3Client();
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: appConfig.storage.bucket,
-      Key: key,
-      Body: createReadStream(localPath),
-      ContentType: "video/mp4",
-    }),
-  );
-  return { path: localPath, key };
-}
-
-/** Stream a Web ReadableStream to disk (avoids loading multi-GB uploads into RAM). */
-export async function saveInputVideoStream(
-  jobId: string,
-  fileName: string,
-  body: ReadableStream<Uint8Array>,
-): Promise<{ path: string; key?: string }> {
-  const extension = path.extname(fileName) || ".mp4";
-  const jobDir = durableJobMediaDir(jobId);
-  const localPath = path.join(jobDir, `input${extension}`);
-  await mkdir(jobDir, { recursive: true });
+/** Stream a Web ReadableStream to a local file without buffering in RAM. */
+export async function streamToFile(
+  readableStream: ReadableStream<Uint8Array>,
+  destPath: string,
+): Promise<void> {
+  await mkdir(path.dirname(destPath), { recursive: true });
   await pipeline(
-    Readable.fromWeb(body as Parameters<typeof Readable.fromWeb>[0]),
-    createWriteStream(localPath),
-  );
-
-  if (!isObjectStorageEnabled()) {
-    return { path: localPath };
-  }
-
-  return mirrorInputVideoToObjectStorage(jobId, localPath, extension);
-}
-
-export async function saveInputVideo(jobId: string, fileName: string, bytes: Buffer): Promise<{ path: string; key?: string }> {
-  const extension = path.extname(fileName) || ".mp4";
-  const jobDir = durableJobMediaDir(jobId);
-  const localPath = path.join(jobDir, `input${extension}`);
-  await mkdir(jobDir, { recursive: true });
-  await writeFile(localPath, bytes);
-
-  if (!isObjectStorageEnabled()) {
-    return { path: localPath };
-  }
-
-  return mirrorInputVideoToObjectStorage(jobId, localPath, extension);
-}
-
-export async function promoteCutClipsToDurable(jobId: string, clips: GeneratedClip[]): Promise<GeneratedClip[]> {
-  const destRoot = path.join(durableJobMediaDir(jobId), "clips");
-  await mkdir(destRoot, { recursive: true });
-  return Promise.all(
-    clips.map(async (clip) => {
-      const dest = path.join(destRoot, `${clip.id}.mp4`);
-      await copyFile(clip.path, dest);
-      return { ...clip, path: dest };
-    }),
+    Readable.fromWeb(readableStream as Parameters<typeof Readable.fromWeb>[0]),
+    createWriteStream(destPath),
   );
 }
 
-export async function uploadClipToStorage(
-  jobId: string,
-  clipId: string,
-  clipPath: string,
-): Promise<{ url: string; storageClipKey?: string }> {
-  if (!isObjectStorageEnabled()) {
-    return { url: `/api/clip/${jobId}/${clipId}` };
+const MULTIPART_THRESHOLD = 100 * 1024 * 1024; // 100 MB
+const PART_SIZE = 50 * 1024 * 1024; // 50 MB parts
+
+/** Upload a local file to R2. Uses multipart for files ≥ 100 MB. */
+export async function uploadFileToR2(localPath: string, key: string): Promise<string> {
+  const { bucket } = appConfig.r2;
+  const s3 = createR2Client();
+  const { size } = await import("node:fs").then((fs) =>
+    new Promise<{ size: number }>((res, rej) =>
+      fs.stat(localPath, (err, s) => (err ? rej(err) : res({ size: s.size }))),
+    ),
+  );
+
+  if (size < MULTIPART_THRESHOLD) {
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        Body: createReadStream(localPath),
+        ContentType: "video/mp4",
+        ContentLength: size,
+      }),
+    );
+    return key;
   }
 
-  const key = clipObjectStorageKey(jobId, clipId);
-  const s3 = createS3Client();
+  // Multipart upload for large files
+  const create = await s3.send(
+    new CreateMultipartUploadCommand({ Bucket: bucket, Key: key, ContentType: "video/mp4" }),
+  );
+  const uploadId = create.UploadId!;
+
+  const parts: { ETag: string; PartNumber: number }[] = [];
+  let partNumber = 1;
+  let offset = 0;
+
+  while (offset < size) {
+    const end = Math.min(offset + PART_SIZE, size);
+    const partStream = createReadStream(localPath, { start: offset, end: end - 1 });
+    const result = await s3.send(
+      new UploadPartCommand({
+        Bucket: bucket,
+        Key: key,
+        UploadId: uploadId,
+        PartNumber: partNumber,
+        Body: partStream,
+        ContentLength: end - offset,
+      }),
+    );
+    parts.push({ ETag: result.ETag!, PartNumber: partNumber });
+    partNumber++;
+    offset = end;
+  }
+
   await s3.send(
-    new PutObjectCommand({
-      Bucket: appConfig.storage.bucket,
+    new CompleteMultipartUploadCommand({
+      Bucket: bucket,
       Key: key,
-      Body: createReadStream(clipPath),
-      ContentType: "video/mp4",
+      UploadId: uploadId,
+      MultipartUpload: { Parts: parts },
     }),
   );
 
-  return {
-    url: `${appConfig.storage.basePublicUrl.replace(/\/$/, "")}/${key}`,
-    storageClipKey: key,
-  };
+  return key;
 }
 
-export async function downloadClipToFile(jobId: string, clipId: string, destPath: string): Promise<void> {
-  if (!isObjectStorageEnabled()) {
-    throw new Error("Object storage is not enabled; cannot download clip from bucket.");
-  }
-  const key = clipObjectStorageKey(jobId, clipId);
-  const s3 = createS3Client();
-  const result = await s3.send(
-    new GetObjectCommand({
-      Bucket: appConfig.storage.bucket,
-      Key: key,
-    }),
-  );
-  const body = result.Body;
-  if (!body) {
-    throw new Error(`Empty body for ${key}`);
-  }
-  await pipeline(body as NodeReadable, createWriteStream(destPath));
+/** Download an R2 object to a local file path. */
+export async function downloadFromR2(key: string, destPath: string): Promise<void> {
+  const { bucket } = appConfig.r2;
+  const s3 = createR2Client();
+  await mkdir(path.dirname(destPath), { recursive: true });
+  const result = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  if (!result.Body) throw new Error(`Empty body for R2 key: ${key}`);
+  await pipeline(result.Body as NodeJS.ReadableStream, createWriteStream(destPath));
 }
 
-export async function getClipReadUrl(jobId: string, clipId: string): Promise<string> {
-  if (!isObjectStorageEnabled()) {
-    return `/api/clip/${jobId}/${clipId}`;
+/** Generate a presigned GET URL for a private R2 object. */
+export async function getPresignedUrl(
+  key: string,
+  expiresIn = appConfig.r2.presignExpiresIn,
+): Promise<string> {
+  const { bucket } = appConfig.r2;
+  const s3 = createR2Client();
+  return getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: key }), { expiresIn });
+}
+
+export async function safeUnlink(filePath: string): Promise<void> {
+  try {
+    await unlink(filePath);
+  } catch {
+    // ignore
   }
-  const key = clipObjectStorageKey(jobId, clipId);
-  const s3 = createS3Client();
-  return getSignedUrl(
-    s3,
-    new GetObjectCommand({
-      Bucket: appConfig.storage.bucket,
-      Key: key,
-    }),
-    { expiresIn: 60 * 30 },
-  );
 }

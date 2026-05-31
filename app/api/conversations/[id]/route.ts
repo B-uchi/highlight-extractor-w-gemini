@@ -1,127 +1,87 @@
 import { NextResponse } from "next/server";
 
-import {
-  ConversationsDisabledError,
-  deleteConversation,
-  getConversation,
-  listAgentTasksForConversation,
-  listMessagesForConversation,
-  updateConversation,
-} from "@/lib/conversations";
-import { getJob, hydrateJobFromStore } from "@/lib/jobs";
-import { isDatabaseEnabled } from "@/lib/db";
-import type { HighlightClipLimitChoice, JobState } from "@/lib/types";
+import { createServerClient } from "@/lib/supabase";
 
 export const runtime = "nodejs";
 
-async function resolveJob(jobId: string | null): Promise<JobState | null> {
-  if (!jobId) {
-    return null;
-  }
-  if (isDatabaseEnabled()) {
-    return (await hydrateJobFromStore(jobId)) ?? getJob(jobId) ?? null;
-  }
-  return getJob(jobId) ?? (await hydrateJobFromStore(jobId)) ?? null;
-}
-
 export async function GET(
-  _request: Request,
+  _req: Request,
   context: { params: Promise<{ id: string }> },
 ) {
   try {
     const { id } = await context.params;
-    const conversation = await getConversation(id);
-    if (!conversation) {
+    const db = createServerClient();
+
+    const [convRes, msgsRes] = await Promise.all([
+      db.from("conversations").select("*").eq("id", id).single(),
+      db.from("messages").select("*").eq("conversation_id", id).order("created_at"),
+    ]);
+
+    if (convRes.error || !convRes.data) {
       return NextResponse.json({ error: "Conversation not found." }, { status: 404 });
     }
 
-    const [messages, agentTasks, job] = await Promise.all([
-      listMessagesForConversation(id),
-      listAgentTasksForConversation(id),
-      resolveJob(conversation.activeJobId),
-    ]);
+    // Attach clips and jobs to messages
+    const jobIds = [...new Set(msgsRes.data?.map((m) => m.job_id).filter(Boolean) as string[])];
+    let jobs: Record<string, unknown> = {};
+    let clipsMap: Record<string, unknown[]> = {};
 
-    return NextResponse.json({ conversation, messages, agentTasks, job });
-  } catch (error) {
-    if (error instanceof ConversationsDisabledError) {
-      return NextResponse.json({ error: error.message }, { status: 503 });
+    if (jobIds.length > 0) {
+      const [jobsRes, clipsRes] = await Promise.all([
+        db.from("jobs").select("*").in("id", jobIds),
+        db.from("clips").select("*").in("job_id", jobIds).order("rank"),
+      ]);
+      jobs = Object.fromEntries((jobsRes.data ?? []).map((j) => [j.id, j]));
+      for (const clip of clipsRes.data ?? []) {
+        if (!clipsMap[clip.job_id]) clipsMap[clip.job_id] = [];
+        clipsMap[clip.job_id].push(clip);
+      }
     }
-    const message = error instanceof Error ? error.message : "Unexpected error.";
-    return NextResponse.json({ error: message }, { status: 500 });
+
+    const messages = (msgsRes.data ?? []).map((m) => ({
+      ...m,
+      job: m.job_id ? (jobs[m.job_id] ?? null) : null,
+      clips: m.job_id ? (clipsMap[m.job_id] ?? []) : [],
+    }));
+
+    return NextResponse.json({ conversation: convRes.data, messages });
+  } catch (err) {
+    return NextResponse.json({ error: err instanceof Error ? err.message : "Unexpected error." }, { status: 500 });
   }
 }
 
 export async function PATCH(
-  request: Request,
+  req: Request,
   context: { params: Promise<{ id: string }> },
 ) {
   try {
     const { id } = await context.params;
-    const body = (await request.json()) as {
-      title?: string;
-      archived?: boolean;
-      highlight_clip_limit?: HighlightClipLimitChoice | "unlimited" | number | string | null;
-    };
-    const existing = await getConversation(id);
-    if (!existing) {
-      return NextResponse.json({ error: "Conversation not found." }, { status: 404 });
-    }
+    const db = createServerClient();
+    const body = (await req.json()) as { title?: string; archived?: boolean };
 
-    const patch: Parameters<typeof updateConversation>[1] = {};
+    const patch: Record<string, unknown> = { updated_at: new Date().toISOString() };
+
     if (typeof body.title === "string") {
       const title = body.title.trim();
-      if (!title) {
-        return NextResponse.json({ error: "Title cannot be empty." }, { status: 400 });
-      }
+      if (!title) return NextResponse.json({ error: "Title cannot be empty." }, { status: 400 });
       patch.title = title;
     }
+
     if (typeof body.archived === "boolean") {
-      patch.archivedAt = body.archived ? new Date().toISOString() : null;
-    }
-    if (body.highlight_clip_limit !== undefined) {
-      const v = body.highlight_clip_limit;
-      if (v === null || v === "unlimited") {
-        patch.highlightClipLimit = null;
-      } else if (v === 5 || v === 10 || v === 15) {
-        patch.highlightClipLimit = v;
-      } else if (v === "5" || v === "10" || v === "15") {
-        patch.highlightClipLimit = Number(v) as 5 | 10 | 15;
-      } else {
-        return NextResponse.json({ error: "Invalid highlight_clip_limit." }, { status: 400 });
-      }
+      patch.archived_at = body.archived ? new Date().toISOString() : null;
+      patch.status = body.archived ? "archived" : "active";
     }
 
-    if (Object.keys(patch).length === 0) {
-      return NextResponse.json({ error: "No valid fields to update." }, { status: 400 });
-    }
+    const { data, error } = await db
+      .from("conversations")
+      .update(patch)
+      .eq("id", id)
+      .select()
+      .single();
 
-    const conversation = await updateConversation(id, patch);
-    return NextResponse.json({ conversation });
-  } catch (error) {
-    if (error instanceof ConversationsDisabledError) {
-      return NextResponse.json({ error: error.message }, { status: 503 });
-    }
-    const message = error instanceof Error ? error.message : "Unexpected error.";
-    return NextResponse.json({ error: message }, { status: 500 });
-  }
-}
-
-export async function DELETE(
-  _request: Request,
-  context: { params: Promise<{ id: string }> },
-) {
-  try {
-    const { id } = await context.params;
-    const deleted = await deleteConversation(id);
-    if (!deleted) {
-      return NextResponse.json({ error: "Conversation not found." }, { status: 404 });
-    }
-    return NextResponse.json({ ok: true });
-  } catch (error) {
-    if (error instanceof ConversationsDisabledError) {
-      return NextResponse.json({ error: error.message }, { status: 503 });
-    }
-    const message = error instanceof Error ? error.message : "Unexpected error.";
-    return NextResponse.json({ error: message }, { status: 500 });
+    if (error) throw new Error(error.message);
+    return NextResponse.json({ conversation: data });
+  } catch (err) {
+    return NextResponse.json({ error: err instanceof Error ? err.message : "Unexpected error." }, { status: 500 });
   }
 }

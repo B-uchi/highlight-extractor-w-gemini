@@ -13,11 +13,7 @@ export default function DashboardHomePage() {
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/conversations", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title: "New conversation" }),
-      });
+      const res = await fetch("/api/conversations", { method: "POST" });
       const payload = (await res.json()) as { conversation?: { id: string }; error?: string };
       if (!res.ok || !payload.conversation) {
         setError(payload.error ?? "Could not create a conversation.");
@@ -37,8 +33,8 @@ export default function DashboardHomePage() {
           <h1 className="text-2xl font-semibold text-zinc-50">Welcome</h1>
         </div>
         <p className="mt-3 text-sm leading-relaxed text-zinc-400">
-          Start a conversation, upload a video, and collaborate with the agent to extract highlights, refine results,
-          explain clips, and stitch reels.
+          Start a conversation, upload a basketball game video, and ask for specific highlights —
+          dunks, blocks, player reels, team compilations, and more. Powered by Gemini.
         </p>
 
         {error && (
@@ -52,7 +48,7 @@ export default function DashboardHomePage() {
             type="button"
             disabled={busy}
             onClick={() => void start()}
-            className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white disabled:opacity-60"
+            className="inline-flex items-center gap-2 rounded-xl bg-blue-600 px-5 py-3 text-sm font-semibold text-white hover:bg-blue-500 disabled:opacity-60 transition-colors"
           >
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
             Start a conversation
