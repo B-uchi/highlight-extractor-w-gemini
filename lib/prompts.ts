@@ -90,6 +90,16 @@ const OUTPUT_SCHEMA = `Return a JSON array only — no markdown, no explanation,
     "jerseyColor": "clearly identifiable color string, or null"
   }
 ]
+
+Field definitions:
+- title: action name only, e.g. "Dunk" or "Block — #5". Omit jersey part if number not visible. DO NOT EVER GUESS JERSEY NUMBER IF ACTION ACTOR IDENTITY IS UNCLEAR.
+- description: 1-2 sentences of what you actually observe. No fabrication.
+- start_sec: exact second the play begins to develop, drive before layups, run before dunks, jumps before rebounds, positioning before 3pt, stance before free throw, action before foul, shot before out of bounds. basketball contains subtle preaction cues before main action, clips are preferred to start exactly at the pre action cue. this needs to be exace and will be used for cutting).
+- end_sec: approximate second the play fully resolves, ball drops after basket(applies to freethrow, 3pt, dunk, basket scoring actions), player descends after rebound, positioning set after foul call, used for cutting.
+- rank: 1 = most impactful.
+- confidence: honest self-assessment of returned clips, action certainty from buildup to post action matching what was requested, 0.0–1.0. Omit if below 0.65.
+- jerseyNumber / jerseyColor: only if clearly identifiable. null otherwise.
+
 If no qualifying clips are found, return [].`;
 
 function jerseyFilterInstruction(job: Job): string {

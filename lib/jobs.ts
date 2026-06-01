@@ -49,6 +49,10 @@ function offsetClips(
   }));
 }
 
+// Padding applied around Gemini's start_sec/end_sec when cutting each clip.
+const PRE_ACTION_PAD = 2.5;   // seconds before start_sec: captures the build-up
+const POST_ACTION_PAD = 2.0;  // seconds after end_sec: captures the completion beat
+
 function deduplicateNearBoundary(
   clips: GeminiClipResult[],
   boundaries: number[],
@@ -112,15 +116,19 @@ async function extractAndUploadClip(
   id: string;
   r2_clip_key: string;
   r2_clip_url: string;
+  start_sec: number;
+  end_sec: number;
   follow_up_end_sec: number | null;
 }> {
   const clipId = randomUUID();
   const tmpOut = path.join(process.cwd(), "tmp", jobId, `clip_${clipIndex}.mp4`);
 
-  const endSec = followUpSecs ? clip.end_sec + followUpSecs : clip.end_sec;
-  const followUpEndSec = followUpSecs ? clip.end_sec + followUpSecs : null;
+  const cutStart = Math.max(0, clip.start_sec - PRE_ACTION_PAD);
+  const naturalEnd = clip.end_sec + POST_ACTION_PAD;
+  const cutEnd = followUpSecs ? naturalEnd + followUpSecs : naturalEnd;
+  const followUpEndSec = followUpSecs ? naturalEnd + followUpSecs : null;
 
-  await cutClip(sourcePath, clip.start_sec, endSec, tmpOut);
+  await cutClip(sourcePath, cutStart, cutEnd, tmpOut);
 
   const r2Key = `clips/${conversationId}/${jobId}/${clip.rank}-${clipId}.mp4`;
   await uploadFileToR2(tmpOut, r2Key);
@@ -128,7 +136,14 @@ async function extractAndUploadClip(
 
   const url = await getPresignedUrl(r2Key);
 
-  return { id: clipId, r2_clip_key: r2Key, r2_clip_url: url, follow_up_end_sec: followUpEndSec };
+  return {
+    id: clipId,
+    r2_clip_key: r2Key,
+    r2_clip_url: url,
+    start_sec: cutStart,
+    end_sec: naturalEnd,
+    follow_up_end_sec: followUpEndSec,
+  };
 }
 
 // ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -271,8 +286,8 @@ export async function processJob(jobId: string): Promise<void> {
             conversation_id: job!.conversation_id,
             title: clip.title,
             description: clip.description ?? null,
-            start_sec: clip.start_sec,
-            end_sec: clip.end_sec,
+            start_sec: uploaded.start_sec,
+            end_sec: uploaded.end_sec,
             follow_up_end_sec: uploaded.follow_up_end_sec,
             rank: clip.rank,
             jersey_number: clip.jerseyNumber ?? null,

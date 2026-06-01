@@ -96,8 +96,9 @@ create table if not exists clips (
   conversation_id     uuid not null references conversations (id) on delete cascade,
   title               text not null,
   description         text,
-  start_sec           float not null,
-  end_sec             float not null,
+  peak_sec            float,             -- decisive moment from Gemini (shot release, dunk apex, etc.)
+  start_sec           float not null,    -- actual cut start = peak_sec - PRE_PAD
+  end_sec             float not null,    -- actual cut end = peak_sec + POST_PAD
   follow_up_end_sec   float,
   rank                integer not null,
   jersey_number       text,

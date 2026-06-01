@@ -75,12 +75,14 @@ export async function slowdownVideo(
   outputPath: string,
   factor: number,
 ): Promise<void> {
+  // -movflags +faststart is intentionally omitted — it requires FFmpeg to reopen the
+  // output file for a second pass (moov atom shift) which fails in some environments.
+  // Gemini uploads don't need progressive-download ordering; moov-at-end is fine.
   await run([
     "-y", "-i", inputPath,
     "-vf", `setpts=${factor}*PTS`,
     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
     "-an",
-    "-movflags", "+faststart",
     outputPath,
   ]);
 }

@@ -24,6 +24,8 @@ export const appConfig = {
     // FPS passed to Gemini's videoMetadata. Lower than 10 to stay within token budget
     // when slowdown > 1.
     analysisFps,
+    // Minimum confidence score to keep a clip. Raise to reduce false positives.
+    minConfidence: Number(process.env.GEMINI_MIN_CONFIDENCE ?? 0.75),
   },
   r2: {
     accountId: process.env.R2_ACCOUNT_ID ?? "",

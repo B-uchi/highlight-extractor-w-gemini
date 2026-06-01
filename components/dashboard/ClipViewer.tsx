@@ -12,22 +12,35 @@ interface ClipViewerProps {
   onClose: () => void;
 }
 
-async function fetchFreshUrl(clipId: string): Promise<string | null> {
+async function fetchPlayUrl(clipId: string): Promise<string | null> {
   const res = await fetch(`/api/clips/${clipId}/url`);
   if (!res.ok) return null;
-  const data = await res.json() as { url: string };
-  return data.url;
+  return (await res.json() as { url: string }).url;
+}
+
+async function fetchDownloadUrl(clipId: string): Promise<string | null> {
+  // Uses Content-Disposition: attachment so browser downloads instead of opening a tab.
+  const res = await fetch(`/api/clips/${clipId}/download`);
+  if (!res.ok) return null;
+  return (await res.json() as { url: string }).url;
 }
 
 // ── Individual clip player ────────────────────────────────────────────────────
 
-function IndividualViewer({ clips, jobId }: { clips: Clip[]; jobId: string }) {
+function IndividualViewer({ clips }: { clips: Clip[] }) {
   const [activeIdx, setActiveIdx] = useState(0);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [loadingUrl, setLoadingUrl] = useState(false);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const clip = clips[activeIdx];
+
+  const showToast = (msg: string, durationMs = 2500) => {
+    setToast(msg);
+    setTimeout(() => setToast(null), durationMs);
+  };
 
   const loadClip = useCallback(async (idx: number) => {
     const c = clips[idx];
@@ -35,7 +48,7 @@ function IndividualViewer({ clips, jobId }: { clips: Clip[]; jobId: string }) {
     setVideoUrl(null);
     setLoadingUrl(true);
     try {
-      const url = await fetchFreshUrl(c.id);
+      const url = await fetchPlayUrl(c.id);
       setVideoUrl(url);
     } finally {
       setLoadingUrl(false);
@@ -63,13 +76,22 @@ function IndividualViewer({ clips, jobId }: { clips: Clip[]; jobId: string }) {
     return () => window.removeEventListener("keydown", handler);
   }, [activeIdx, clips.length]);
 
-  async function download() {
-    const url = await fetchFreshUrl(clip.id);
-    if (!url) return;
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${clip.title}.mp4`;
-    a.click();
+  async function download(c: Clip) {
+    if (downloadingId) return;
+    setDownloadingId(c.id);
+    showToast("Preparing download...", 8000);
+    try {
+      const url = await fetchDownloadUrl(c.id);
+      if (!url) { showToast("Download failed."); return; }
+      // Navigate to the URL — the server sets Content-Disposition: attachment
+      // so the browser will download instead of opening in a tab.
+      window.location.href = url;
+      showToast("Download started.");
+    } catch {
+      showToast("Download failed.");
+    } finally {
+      setDownloadingId(null);
+    }
   }
 
   const duration = formatDuration((clip.follow_up_end_sec ?? clip.end_sec) - clip.start_sec);
@@ -80,6 +102,12 @@ function IndividualViewer({ clips, jobId }: { clips: Clip[]; jobId: string }) {
     <div className="flex h-full flex-col">
       {/* Video player */}
       <div className="relative bg-black shrink-0">
+        {/* Toast notification */}
+        {toast && (
+          <div className="absolute bottom-3 left-1/2 z-20 -translate-x-1/2 rounded-full bg-zinc-800/90 px-3 py-1.5 text-xs text-zinc-200 shadow-lg backdrop-blur-sm ring-1 ring-zinc-700/60 pointer-events-none">
+            {toast}
+          </div>
+        )}
         {loadingUrl ? (
           <div className="flex aspect-video items-center justify-center">
             <div className="h-6 w-6 animate-spin rounded-full border-2 border-zinc-700 border-t-blue-400" />
@@ -130,11 +158,12 @@ function IndividualViewer({ clips, jobId }: { clips: Clip[]; jobId: string }) {
           </div>
           <button
             type="button"
-            onClick={() => void download()}
+            onClick={() => void download(clip)}
             title="Download clip"
-            className="shrink-0 rounded-lg bg-zinc-800 p-1.5 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100 transition-colors"
+            disabled={!!downloadingId}
+            className="shrink-0 rounded-lg bg-zinc-800 p-1.5 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100 transition-colors disabled:opacity-50"
           >
-            <Download className="h-3.5 w-3.5" />
+            <Download className={`h-3.5 w-3.5 ${downloadingId === clip.id ? "animate-pulse" : ""}`} />
           </button>
         </div>
 
@@ -328,7 +357,7 @@ export function ClipViewer({ job, clips, onClose }: ClipViewerProps) {
         {isCompilation ? (
           <CompilationViewer job={job} clips={clips} />
         ) : (
-          <IndividualViewer clips={clips} jobId={job.id} />
+          <IndividualViewer clips={clips} />
         )}
       </div>
     </div>

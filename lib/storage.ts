@@ -136,6 +136,26 @@ export async function getPresignedUrl(
   return getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: key }), { expiresIn });
 }
 
+/**
+ * Presigned URL that includes Content-Disposition: attachment so the browser
+ * downloads the file instead of opening it in a tab (works cross-origin).
+ */
+export async function getPresignedDownloadUrl(key: string, filename: string): Promise<string> {
+  const { bucket } = appConfig.r2;
+  const s3 = createR2Client();
+  const safeFilename = filename.replace(/[^\w\s.-]/g, "_");
+  return getSignedUrl(
+    s3,
+    new GetObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      ResponseContentDisposition: `attachment; filename="${safeFilename}"`,
+      ResponseContentType: "video/mp4",
+    }),
+    { expiresIn: 300 }, // 5 minutes — enough for the download to start
+  );
+}
+
 export async function safeUnlink(filePath: string): Promise<void> {
   try {
     await unlink(filePath);
