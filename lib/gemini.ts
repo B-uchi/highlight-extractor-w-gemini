@@ -252,8 +252,8 @@ export async function analyzeChunk(
       : buildCompilationPrompt(job, chunkDurationSec);
 
   const response = await ai.models.generateContent({
-    // model: "gemini-3.1-pro-preview", # ab testing the flash model
-    model: "gemini-2.5-flash",
+    model: "gemini-3.1-pro-preview", // ab testing the flash model
+    // model: "gemini-3.5-flash",
     contents: [
       {
         role: "user",
