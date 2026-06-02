@@ -7,6 +7,7 @@ import { pipeline } from "node:stream/promises";
 import {
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
+  DeleteObjectCommand,
   GetObjectCommand,
   PutObjectCommand,
   S3Client,
@@ -124,6 +125,28 @@ export async function downloadFromR2(key: string, destPath: string): Promise<voi
   const result = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
   if (!result.Body) throw new Error(`Empty body for R2 key: ${key}`);
   await pipeline(result.Body as NodeJS.ReadableStream, createWriteStream(destPath));
+}
+
+/**
+ * Generate a presigned PUT URL so the browser can upload a file straight to R2,
+ * bypassing the Vercel function body limit (no video bytes proxied through the API).
+ * ContentType is intentionally NOT signed — the browser sets it on the file, and
+ * leaving it unsigned avoids SignatureDoesNotMatch errors on the PUT.
+ */
+export async function getPresignedUploadUrl(
+  key: string,
+  expiresIn = 3600,
+): Promise<string> {
+  const { bucket } = appConfig.r2;
+  const s3 = createR2Client();
+  return getSignedUrl(s3, new PutObjectCommand({ Bucket: bucket, Key: key }), { expiresIn });
+}
+
+/** Delete an object from R2 (best-effort cleanup of temporary raw uploads). */
+export async function deleteFromR2(key: string): Promise<void> {
+  const { bucket } = appConfig.r2;
+  const s3 = createR2Client();
+  await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
 }
 
 /** Generate a presigned GET URL for a private R2 object. */

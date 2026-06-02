@@ -12,7 +12,7 @@ interface UploadZoneProps {
 
 type Step =
   | { key: "idle" }
-  | { key: "uploading"; events: UploadProgressEvent[] }
+  | { key: "uploading"; current: string; events: UploadProgressEvent[] }
   | { key: "done" }
   | { key: "error"; message: string };
 
@@ -28,11 +28,32 @@ function stepLabel(event: UploadProgressEvent): string {
   return event.message;
 }
 
+// PUT a file straight to R2 via a presigned URL, reporting upload progress.
+// Uses XHR because fetch() has no upload-progress events.
+function putToR2(url: string, file: File, onProgress: (pct: number) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", url);
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100));
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new Error(`Upload failed (${xhr.status})`));
+    };
+    xhr.onerror = () => reject(new Error("Network error during upload."));
+    xhr.send(file);
+  });
+}
+
 export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [step, setStep] = useState<Step>({ key: "idle" });
   const [dragOver, setDragOver] = useState(false);
 
+  // Processing holds the connection open while chunks upload to Gemini, which can
+  // outlast a browser/proxy timeout. If the stream dies before "done", fall back
+  // to polling status — the server sets it "active" once the video is stored.
   async function confirmReadyViaStatus(): Promise<boolean> {
     for (let attempt = 0; attempt < 10; attempt++) {
       try {
@@ -54,24 +75,47 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
     setTimeout(() => onComplete(), 800);
   }
 
+  function pushEvent(current: string, event?: UploadProgressEvent) {
+    setStep((prev) => {
+      const prevEvents = prev.key === "uploading" ? prev.events : [];
+      return { key: "uploading", current, events: event ? [...prevEvents, event] : prevEvents };
+    });
+  }
+
   async function upload(file: File) {
     if (file.size === 0) {
       setStep({ key: "error", message: "Selected file is empty." });
       return;
     }
 
-    setStep({ key: "uploading", events: [{ step: "preprocessing", message: "Receiving file..." }] });
-
-    const form = new FormData();
-    form.append("video", file);
-
-    let sawDone = false;
-    let sawError = false;
+    setStep({ key: "uploading", current: "Preparing upload...", events: [] });
 
     try {
-      const res = await fetch(`/api/conversations/${conversationId}/upload`, {
+      // 1) Ask the server for a presigned PUT URL
+      const urlRes = await fetch(`/api/conversations/${conversationId}/upload-url`, {
         method: "POST",
-        body: form,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ filename: file.name }),
+      });
+      if (!urlRes.ok) {
+        const { error } = (await urlRes.json().catch(() => ({}))) as { error?: string };
+        throw new Error(error ?? "Could not start upload.");
+      }
+      const { uploadUrl, key } = (await urlRes.json()) as { uploadUrl: string; key: string };
+
+      // 2) Upload the raw file directly to R2 (bypasses the API body limit)
+      pushEvent("Uploading video... 0%");
+      await putToR2(uploadUrl, file, (pct) => pushEvent(`Uploading video... ${pct}%`));
+      pushEvent("Processing video...", { step: "preprocessing", message: "Video uploaded" });
+
+      // 3) Trigger server-side processing and stream progress
+      let sawDone = false;
+      let sawError = false;
+
+      const res = await fetch(`/api/conversations/${conversationId}/complete`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, filename: file.name }),
       });
 
       const reader = res.body?.getReader();
@@ -100,10 +144,7 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
               finish();
               return;
             }
-            setStep((prev) => {
-              const prevEvents = prev.key === "uploading" ? prev.events : [];
-              return { key: "uploading", events: [...prevEvents, event] };
-            });
+            pushEvent(stepLabel(event), event);
           } catch {
             // ignore parse errors on partial lines
           }
@@ -113,12 +154,11 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
       // Stream ended without an explicit done/error — verify via status.
       if (!sawDone && !sawError) {
         if (await confirmReadyViaStatus()) finish();
-        else setStep({ key: "error", message: "Upload did not complete. Please try again." });
+        else setStep({ key: "error", message: "Processing did not complete. Please try again." });
       }
     } catch (err) {
-      // The connection may have dropped only after the server finished the work —
-      // check status before surfacing an error.
-      if (!sawDone && !sawError && (await confirmReadyViaStatus())) {
+      // The connection may have dropped only after the server finished — check status first.
+      if (await confirmReadyViaStatus()) {
         finish();
         return;
       }
@@ -139,7 +179,7 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
   }
 
   const events = step.key === "uploading" ? step.events : [];
-  const lastEvent = events[events.length - 1];
+  const current = step.key === "uploading" ? step.current : "";
 
   return (
     <div className="flex h-full flex-col items-center justify-center p-8">
@@ -193,7 +233,7 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
             <Loader2 className="h-8 w-8 animate-spin text-blue-400" />
             <div className="w-full space-y-2">
               <p className="text-sm font-medium text-zinc-100">
-                {lastEvent ? stepLabel(lastEvent) : "Processing..."}
+                {current || "Processing..."}
               </p>
               <div className="space-y-1">
                 {events.map((ev, i) => (
