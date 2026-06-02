@@ -252,7 +252,8 @@ export async function analyzeChunk(
       : buildCompilationPrompt(job, chunkDurationSec);
 
   const response = await ai.models.generateContent({
-    model: "gemini-3.1-pro-preview",
+    // model: "gemini-3.1-pro-preview", # ab testing the flash model
+    model: "gemini-2.5-flash",
     contents: [
       {
         role: "user",
@@ -262,11 +263,6 @@ export async function analyzeChunk(
               fileUri: geminiFileUri,
               mimeType: "video/mp4",
             },
-            // 4fps: enough to catch fast basketball moves (dunks ~0.3-0.5s = 3-5 frames)
-            // without consuming excessive tokens. Timestamps are always wall-clock seconds,
-            // not frame indices.
-            // fps kept lower when slowdown > 1 to stay within the 1M token budget.
-            // Default slowdown=4, fps=3 → effectively 12fps of original content coverage.
             videoMetadata: { fps: appConfig.gemini.analysisFps },
           },
           { text: systemPrompt },
