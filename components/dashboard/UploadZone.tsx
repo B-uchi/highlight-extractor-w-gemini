@@ -33,6 +33,27 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
   const [step, setStep] = useState<Step>({ key: "idle" });
   const [dragOver, setDragOver] = useState(false);
 
+  async function confirmReadyViaStatus(): Promise<boolean> {
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try {
+        const res = await fetch(`/api/conversations/${conversationId}`, { cache: "no-store" });
+        if (res.ok) {
+          const data = (await res.json()) as { conversation?: { status?: string } };
+          if (data.conversation?.status === "active") return true;
+        }
+      } catch {
+        // transient — retry
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    return false;
+  }
+
+  function finish() {
+    setStep({ key: "done" });
+    setTimeout(() => onComplete(), 800);
+  }
+
   async function upload(file: File) {
     if (file.size === 0) {
       setStep({ key: "error", message: "Selected file is empty." });
@@ -43,6 +64,9 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
 
     const form = new FormData();
     form.append("video", file);
+
+    let sawDone = false;
+    let sawError = false;
 
     try {
       const res = await fetch(`/api/conversations/${conversationId}/upload`, {
@@ -66,24 +90,38 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
           if (!line.trim()) continue;
           try {
             const event = JSON.parse(line) as UploadProgressEvent;
+            if (event.step === "error") {
+              sawError = true;
+              setStep({ key: "error", message: event.error ?? event.message });
+              return;
+            }
+            if (event.step === "done") {
+              sawDone = true;
+              finish();
+              return;
+            }
             setStep((prev) => {
-              if (event.step === "error") {
-                return { key: "error", message: event.error ?? event.message };
-              }
-              if (event.step === "done") return { key: "done" };
               const prevEvents = prev.key === "uploading" ? prev.events : [];
               return { key: "uploading", events: [...prevEvents, event] };
             });
-            if (event.step === "done") {
-              setTimeout(() => onComplete(), 800);
-              return;
-            }
           } catch {
             // ignore parse errors on partial lines
           }
         }
       }
+
+      // Stream ended without an explicit done/error — verify via status.
+      if (!sawDone && !sawError) {
+        if (await confirmReadyViaStatus()) finish();
+        else setStep({ key: "error", message: "Upload did not complete. Please try again." });
+      }
     } catch (err) {
+      // The connection may have dropped only after the server finished the work —
+      // check status before surfacing an error.
+      if (!sawDone && !sawError && (await confirmReadyViaStatus())) {
+        finish();
+        return;
+      }
       setStep({ key: "error", message: err instanceof Error ? err.message : "Upload failed." });
     }
   }
