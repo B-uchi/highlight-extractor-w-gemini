@@ -73,18 +73,18 @@ export async function POST(
 
     try {
       // Pull the raw upload back from R2
-      emit({ step: "preprocessing", message: "Fetching uploaded video..." });
+      // emit({ step: "preprocessing", message: "Fetching uploaded video..." });
       await downloadFromR2(rawKey, rawPath);
 
       // Transcode to 720p H.264
-      emit({ step: "preprocessing", message: "Transcoding to 720p..." });
+      emit({ step: "preprocessing", message: "Transcoding..." });
       await preprocessVideo(rawPath, processedPath);
       await rm(rawPath, { force: true });
 
       const durationSecs = await getVideoDuration(processedPath);
 
       // Store the processed video at the canonical key
-      emit({ step: "uploading_r2", message: "Storing video..." });
+      emit({ step: "uploading_r2", message: "Processing..." });
       const r2Key = `videos/${id}/${Date.now()}.mp4`;
       await uploadFileToR2(processedPath, r2Key);
 
