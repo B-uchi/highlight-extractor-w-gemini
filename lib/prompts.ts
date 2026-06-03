@@ -42,8 +42,11 @@ function timestampRules(chunkDurationSec: number, padded: boolean): string {
 
   return `TIMESTAMP RULES — READ CAREFULLY:
 - Timestamps are floating-point SECONDS of real video time from the start of this video.
-- Format: a plain decimal number, e.g. 72.5 means 1 minute 12.5 seconds in.
-- Do NOT use mm:ss format. Do NOT return frame numbers. Do NOT return fps-relative values.
+- Format: a plain decimal number. You MUST mathematically convert minutes to seconds.
+- Example: 1 minute 12.5 seconds = (1 * 60) + 12.5 = 72.5. Output: 72.5
+- Example: 4 minutes 10.0 seconds = (4 * 60) + 10.0 = 250.0. Output: 250.0
+- CRITICAL: Do NOT just remove the colon from mm:ss. 4 minutes 10 seconds is NOT 410.0. It is 250.0.
+- Do NOT return frame numbers. Do NOT return fps-relative values.
 - This video segment is ${chunkDurationSec.toFixed(1)} seconds long (${readable}).
   Every timestamp MUST be between 0.0 and ${chunkDurationSec.toFixed(1)}.
   Any timestamp outside this range is wrong — reject it.
@@ -60,18 +63,24 @@ ${padded
 const QUALITY_RULES = `HONESTY RULES — these are mandatory:
 - jerseyNumber: set ONLY if the number is clearly legible on the jersey in the video.
   If it is not clearly readable, set to null. Do NOT guess, infer, or approximate.
+  If the request filters by jersey number, you MUST verify the number is visible before returning the clip.
 - jerseyColor: set ONLY if the team color is clearly identifiable.
   If lighting or angle makes the color ambiguous, set to null.
 - description: describe only what you actually observe in the clip.
   Do not fabricate details or invent context. If uncertain, keep it brief and general.
-- confidence: honest self-assessment of how certain you are this is the correct action.
-  Never inflate. Clips with confidence below 0.6 must be omitted entirely.
+- confidence: honest self-assessment (0.0 to 1.0) of how certain you are this is the correct action and that it successfully completed.
+  Never inflate. Clips with confidence below 0.8 must be omitted entirely. Do not guess on blurry or obstructed actions.
 - clips: only return clips that are genuinely present in the video.
   If fewer clips exist than any stated maximum, return only what is there — do not invent clips.
   If more clips exist than any stated maximum, return the best ones up to the limit.
 - Player must be clearly visible and directly involved in the play.
 - The play result must be positive or defensively impactful.
-- Omit dead time, inbound delays, and free throws (unless completing an and-1).`;
+- Omit dead time, inbound delays, and free throws (unless completing an and-1).
+
+NEGATIVE RULES — CRITICAL TO REDUCE FALSE POSITIVES:
+- Do NOT flag a timestamp if the ball bounces off the rim and away (missed shot).
+- Do NOT flag a timestamp if a player is shooting around during a dead ball or after the whistle.
+- Do NOT flag a timestamp if the referee has stopped play.`;
 
 const RANKING_ORDER = `RANKING ORDER (1 = most valuable):
 Dunks > Blocks > Steals leading to points > Made 3-pointers > Assists >
@@ -80,6 +89,7 @@ Tough finishes/and-1s > Transition plays > Rebounds > Defensive stops > Hustle p
 const OUTPUT_SCHEMA = `Return a JSON array only — no markdown, no explanation, no wrapper object:
 [
   {
+    "reasoning": "Step-by-step visual chain of thought. Describe the trajectory of the ball, player positioning, and outcome before deciding.",
     "title": "string — '<Action>' or '<Action> — #<jersey>' only if jersey number is clearly visible",
     "description": "1–2 sentences of what you actually observe. No fabrication.",
     "start_sec": float,
@@ -92,12 +102,13 @@ const OUTPUT_SCHEMA = `Return a JSON array only — no markdown, no explanation,
 ]
 
 Field definitions:
+- reasoning: Step-by-step visual chain of thought. Narrate the sequence (e.g., "Ball leaves hand, travels to hoop, passes through net") BEFORE deciding if it's a highlight.
 - title: action name only, e.g. "Dunk" or "Block — #5". Omit jersey part if number not visible. DO NOT EVER GUESS JERSEY NUMBER IF ACTION ACTOR IDENTITY IS UNCLEAR.
 - description: 1-2 sentences of what you actually observe. No fabrication.
 - start_sec: exact second the play begins to develop, drive before layups, run before dunks, jumps before rebounds, positioning before 3pt, stance before free throw, action before foul, shot before out of bounds. basketball contains subtle preaction cues before main action, clips are preferred to start exactly at the pre action cue. this needs to be exace and will be used for cutting).
 - end_sec: approximate second the play fully resolves, ball drops after basket(applies to freethrow, 3pt, dunk, basket scoring actions), player descends after rebound, positioning set after foul call, used for cutting.
 - rank: 1 = most impactful.
-- confidence: honest self-assessment of returned clips, action certainty from buildup to post action matching what was requested, 0.0–1.0. Omit if below 0.65.
+- confidence: honest self-assessment of returned clips, action certainty from buildup to post action matching what was requested, 0.0–1.0. Omit if below 0.80.
 - jerseyNumber / jerseyColor: only if clearly identifiable. null otherwise.
 
 If no qualifying clips are found, return [].`;

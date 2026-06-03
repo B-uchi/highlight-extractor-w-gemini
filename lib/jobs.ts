@@ -51,7 +51,7 @@ function offsetClips(
 
 // Padding applied around Gemini's start_sec/end_sec when cutting each clip.
 const PRE_ACTION_PAD = 2.5;   // seconds before start_sec: captures the build-up
-const POST_ACTION_PAD = 2.0;  // seconds after end_sec: captures the completion beat
+const POST_ACTION_PAD = 2.5;  // seconds after end_sec: captures the completion beat
 
 function deduplicateNearBoundary(
   clips: GeminiClipResult[],

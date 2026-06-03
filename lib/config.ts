@@ -6,7 +6,7 @@
 // Default S=4, F=3 → N ≤ 900_000 / (4 × 3 × 258) = 290s ≈ 4.8 min per chunk
 // For a 90-min broadcast: ~18 chunks (analysed in parallel batches of 3)
 
-const slowdown = Number(process.env.GEMINI_VIDEO_SLOWDOWN ?? 4);
+const slowdown = Number(process.env.GEMINI_VIDEO_SLOWDOWN ?? 2);
 const analysisFps = Number(process.env.GEMINI_ANALYSIS_FPS ?? 3);
 const autoChunkSec = Math.floor(900_000 / (slowdown * analysisFps * 258));
 
@@ -25,7 +25,7 @@ export const appConfig = {
     // when slowdown > 1.
     analysisFps,
     // Minimum confidence score to keep a clip. Raise to reduce false positives.
-    minConfidence: Number(process.env.GEMINI_MIN_CONFIDENCE ?? 0.75),
+    minConfidence: Number(process.env.GEMINI_MIN_CONFIDENCE ?? 0.80),
   },
   r2: {
     accountId: process.env.R2_ACCOUNT_ID ?? "",
