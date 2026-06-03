@@ -97,6 +97,8 @@ export interface Clip {
   jersey_color: string | null;
   r2_clip_key: string | null;
   r2_clip_url: string | null;
+  r2_follow_up_clip_key: string | null;
+  r2_follow_up_clip_url: string | null;
   created_at: string;
 }
 

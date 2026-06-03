@@ -12,15 +12,17 @@ interface ClipViewerProps {
   onClose: () => void;
 }
 
-async function fetchPlayUrl(clipId: string): Promise<string | null> {
-  const res = await fetch(`/api/clips/${clipId}/url`);
+async function fetchPlayUrl(clipId: string, type: "main" | "followup" = "main"): Promise<string | null> {
+  const res = await fetch(`/api/clips/${clipId}/url${type === "followup" ? "?type=followup" : ""}`);
   if (!res.ok) return null;
   return (await res.json() as { url: string }).url;
 }
 
-async function fetchDownloadUrl(clipId: string): Promise<string | null> {
-  // Uses Content-Disposition: attachment so browser downloads instead of opening a tab.
-  const res = await fetch(`/api/clips/${clipId}/download`);
+async function fetchDownloadUrl(clipId: string, type: "main" | "followup" | "zip" = "main"): Promise<string | null> {
+  if (type === "zip") {
+    return `/api/clips/${clipId}/zip`;
+  }
+  const res = await fetch(`/api/clips/${clipId}/download${type === "followup" ? "?type=followup" : ""}`);
   if (!res.ok) return null;
   return (await res.json() as { url: string }).url;
 }
@@ -28,13 +30,18 @@ async function fetchDownloadUrl(clipId: string): Promise<string | null> {
 // ── Individual clip player ────────────────────────────────────────────────────
 
 function IndividualViewer({ clips }: { clips: Clip[] }) {
-  const [activeIdx, setActiveIdx] = useState(0);
+  const [activeState, setActiveState] = useState<{ idx: number; type: "main" | "followup" }>({
+    idx: 0,
+    type: "main",
+  });
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [loadingUrl, setLoadingUrl] = useState(false);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [expandedClips, setExpandedClips] = useState<Set<number>>(new Set([0]));
 
+  const activeIdx = activeState.idx;
   const clip = clips[activeIdx];
 
   const showToast = (msg: string, durationMs = 2500) => {
@@ -42,13 +49,13 @@ function IndividualViewer({ clips }: { clips: Clip[] }) {
     setTimeout(() => setToast(null), durationMs);
   };
 
-  const loadClip = useCallback(async (idx: number) => {
+  const loadClip = useCallback(async (idx: number, type: "main" | "followup") => {
     const c = clips[idx];
     if (!c) return;
     setVideoUrl(null);
     setLoadingUrl(true);
     try {
-      const url = await fetchPlayUrl(c.id);
+      const url = await fetchPlayUrl(c.id, type);
       setVideoUrl(url);
     } finally {
       setLoadingUrl(false);
@@ -56,8 +63,13 @@ function IndividualViewer({ clips }: { clips: Clip[] }) {
   }, [clips]);
 
   useEffect(() => {
-    void loadClip(activeIdx);
-  }, [activeIdx, loadClip]);
+    void loadClip(activeState.idx, activeState.type);
+    setExpandedClips((prev) => {
+      const next = new Set(prev);
+      next.add(activeState.idx);
+      return next;
+    });
+  }, [activeState, loadClip]);
 
   useEffect(() => {
     if (videoUrl && videoRef.current) {
@@ -69,22 +81,20 @@ function IndividualViewer({ clips }: { clips: Clip[] }) {
   // Keyboard nav
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.key === "ArrowLeft" && activeIdx > 0) setActiveIdx((i) => i - 1);
-      if (e.key === "ArrowRight" && activeIdx < clips.length - 1) setActiveIdx((i) => i + 1);
+      if (e.key === "ArrowLeft" && activeIdx > 0) setActiveState({ idx: activeIdx - 1, type: "main" });
+      if (e.key === "ArrowRight" && activeIdx < clips.length - 1) setActiveState({ idx: activeIdx + 1, type: "main" });
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [activeIdx, clips.length]);
 
-  async function download(c: Clip) {
+  async function download(c: Clip, type: "main" | "followup" | "zip" = "main") {
     if (downloadingId) return;
-    setDownloadingId(c.id);
+    setDownloadingId(`${c.id}-${type}`);
     showToast("Preparing download...", 8000);
     try {
-      const url = await fetchDownloadUrl(c.id);
+      const url = await fetchDownloadUrl(c.id, type);
       if (!url) { showToast("Download failed."); return; }
-      // Navigate to the URL — the server sets Content-Disposition: attachment
-      // so the browser will download instead of opening in a tab.
       window.location.href = url;
       showToast("Download started.");
     } catch {
@@ -97,6 +107,15 @@ function IndividualViewer({ clips }: { clips: Clip[] }) {
   const duration = formatDuration((clip.follow_up_end_sec ?? clip.end_sec) - clip.start_sec);
   const hasNext = activeIdx < clips.length - 1;
   const hasPrev = activeIdx > 0;
+
+  const toggleExpand = (idx: number) => {
+    setExpandedClips((prev) => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx);
+      else next.add(idx);
+      return next;
+    });
+  };
 
   return (
     <div className="flex h-full flex-col">
@@ -130,7 +149,7 @@ function IndividualViewer({ clips }: { clips: Clip[] }) {
         {hasPrev && (
           <button
             type="button"
-            onClick={() => setActiveIdx((i) => i - 1)}
+            onClick={() => setActiveState({ idx: activeIdx - 1, type: "main" })}
             className="absolute left-2 top-1/2 -translate-y-1/2 rounded-full bg-black/60 p-1.5 text-white hover:bg-black/80 transition-colors"
           >
             <ChevronLeft className="h-4 w-4" />
@@ -139,7 +158,7 @@ function IndividualViewer({ clips }: { clips: Clip[] }) {
         {hasNext && (
           <button
             type="button"
-            onClick={() => setActiveIdx((i) => i + 1)}
+            onClick={() => setActiveState({ idx: activeIdx + 1, type: "main" })}
             className="absolute right-2 top-1/2 -translate-y-1/2 rounded-full bg-black/60 p-1.5 text-white hover:bg-black/80 transition-colors"
           >
             <ChevronRight className="h-4 w-4" />
@@ -151,19 +170,21 @@ function IndividualViewer({ clips }: { clips: Clip[] }) {
       <div className="shrink-0 border-b border-zinc-800/60 px-4 py-3 space-y-2">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <p className="truncate text-sm font-semibold text-zinc-100">{clip.title}</p>
+            <p className="truncate text-sm font-semibold text-zinc-100">
+              {clip.title} {activeState.type === "followup" ? "(Follow Up)" : ""}
+            </p>
             {clip.description && (
               <p className="mt-0.5 text-xs text-zinc-500 line-clamp-2">{clip.description}</p>
             )}
           </div>
           <button
             type="button"
-            onClick={() => void download(clip)}
-            title="Download clip"
+            onClick={() => void download(clip, activeState.type)}
+            title="Download active clip"
             disabled={!!downloadingId}
             className="shrink-0 rounded-lg bg-zinc-800 p-1.5 text-zinc-400 hover:bg-zinc-700 hover:text-zinc-100 transition-colors disabled:opacity-50"
           >
-            <Download className={`h-3.5 w-3.5 ${downloadingId === clip.id ? "animate-pulse" : ""}`} />
+            <Download className={`h-3.5 w-3.5 ${downloadingId === `${clip.id}-${activeState.type}` ? "animate-pulse" : ""}`} />
           </button>
         </div>
 
@@ -171,9 +192,9 @@ function IndividualViewer({ clips }: { clips: Clip[] }) {
           <span className="rounded-full bg-blue-500/15 px-2 py-0.5 text-[10px] font-semibold text-blue-300">
             #{clip.rank}
           </span>
-          <span className="rounded-full bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400">
+          {/* <span className="rounded-full bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400">
             {duration}
-          </span>
+          </span> */}
           {clip.jersey_number && (
             <span className="rounded-full bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400">
               #{clip.jersey_number}
@@ -195,36 +216,124 @@ function IndividualViewer({ clips }: { clips: Clip[] }) {
         <p className="px-4 pt-3 pb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
           {clips.length} clip{clips.length !== 1 ? "s" : ""} · use ← → to navigate
         </p>
-        <ul className="px-3 pb-3 space-y-1">
+        <ul className="px-3 pb-3 space-y-2">
           {clips.map((c, idx) => {
-            const d = formatDuration((c.follow_up_end_sec ?? c.end_sec) - c.start_sec);
-            const isActive = idx === activeIdx;
+            const hasFollowUp = !!c.r2_follow_up_clip_url;
+            const dMain = formatDuration(c.end_sec - c.start_sec);
+            const dFollowUp = c.follow_up_end_sec ? formatDuration(c.follow_up_end_sec - c.end_sec) : "0s";
+            const isExpanded = expandedClips.has(idx);
+
+            if (!hasFollowUp) {
+              // Normal clip display
+              const isActive = idx === activeIdx;
+              return (
+                <li key={c.id}>
+                  <button
+                    type="button"
+                    onClick={() => setActiveState({ idx, type: "main" })}
+                    className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors ${
+                      isActive
+                        ? "bg-blue-500/10 ring-1 ring-blue-500/30"
+                        : "hover:bg-zinc-800/60"
+                    }`}
+                  >
+                    <span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${
+                      isActive ? "bg-blue-500 text-white" : "bg-zinc-800 text-zinc-400"
+                    }`}>
+                      {c.rank}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className={`truncate text-xs font-medium ${isActive ? "text-zinc-100" : "text-zinc-400"}`}>
+                        {c.title}
+                      </p>
+                      {c.description && (
+                        <p className="truncate text-[10px] text-zinc-600">{c.description}</p>
+                      )}
+                    </div>
+                    <span className="shrink-0 text-[10px] text-zinc-600">{dMain}</span>
+                  </button>
+                </li>
+              );
+            }
+
+            // Accordion display for follow-ups
             return (
-              <li key={c.id}>
-                <button
-                  type="button"
-                  onClick={() => setActiveIdx(idx)}
-                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors ${
-                    isActive
-                      ? "bg-blue-500/10 ring-1 ring-blue-500/30"
-                      : "hover:bg-zinc-800/60"
-                  }`}
-                >
-                  <span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${
-                    isActive ? "bg-blue-500 text-white" : "bg-zinc-800 text-zinc-400"
-                  }`}>
+              <li key={c.id} className="rounded-lg bg-zinc-900/50 ring-1 ring-zinc-800/60 overflow-hidden">
+                <div className="flex items-center gap-3 px-3 py-2.5">
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[10px] font-bold bg-zinc-800 text-zinc-400">
                     {c.rank}
                   </span>
-                  <div className="min-w-0 flex-1">
-                    <p className={`truncate text-xs font-medium ${isActive ? "text-zinc-100" : "text-zinc-400"}`}>
+                  <button
+                    type="button"
+                    className="min-w-0 flex-1 text-left"
+                    onClick={() => toggleExpand(idx)}
+                  >
+                    <p className="truncate text-xs font-medium text-zinc-300">
                       {c.title}
                     </p>
                     {c.description && (
                       <p className="truncate text-[10px] text-zinc-600">{c.description}</p>
                     )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void download(c, "zip")}
+                    title="Download Zip Bundle"
+                    className="shrink-0 rounded bg-blue-500/20 px-2 py-1 text-[10px] font-medium text-blue-400 hover:bg-blue-500/30 transition-colors"
+                  >
+                    Download ZIP
+                  </button>
+                </div>
+                
+                {isExpanded && (
+                  <div className="border-t border-zinc-800/60 bg-zinc-950/50 p-2 space-y-1">
+                    {/* Main Clip Sub-item */}
+                    <div className={`flex items-center justify-between rounded-md px-2 py-1.5 transition-colors ${
+                      activeIdx === idx && activeState.type === "main" ? "bg-blue-500/10" : "hover:bg-zinc-800/40"
+                    }`}>
+                      <button
+                        type="button"
+                        className="flex items-center gap-2 flex-1 text-left"
+                        onClick={() => setActiveState({ idx, type: "main" })}
+                      >
+                        <Film className="h-3.5 w-3.5 text-zinc-500" />
+                        <span className="text-xs font-medium text-zinc-300">Main Action</span>
+                        <span className="text-[10px] text-zinc-500 ml-auto mr-2">{dMain}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void download(c, "main")}
+                        className="p-1 text-zinc-500 hover:text-zinc-300"
+                        title="Download main clip"
+                      >
+                        <Download className="h-3 w-3" />
+                      </button>
+                    </div>
+
+                    {/* Follow Up Sub-item */}
+                    <div className={`flex items-center justify-between rounded-md px-2 py-1.5 transition-colors ${
+                      activeIdx === idx && activeState.type === "followup" ? "bg-blue-500/10" : "hover:bg-zinc-800/40"
+                    }`}>
+                      <button
+                        type="button"
+                        className="flex items-center gap-2 flex-1 text-left"
+                        onClick={() => setActiveState({ idx, type: "followup" })}
+                      >
+                        <Film className="h-3.5 w-3.5 text-zinc-500" />
+                        <span className="text-xs font-medium text-zinc-300">Follow Up</span>
+                        <span className="text-[10px] text-zinc-500 ml-auto mr-2">{dFollowUp}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void download(c, "followup")}
+                        className="p-1 text-zinc-500 hover:text-zinc-300"
+                        title="Download follow up clip"
+                      >
+                        <Download className="h-3 w-3" />
+                      </button>
+                    </div>
                   </div>
-                  <span className="shrink-0 text-[10px] text-zinc-600">{d}</span>
-                </button>
+                )}
               </li>
             );
           })}

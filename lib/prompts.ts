@@ -130,7 +130,7 @@ function clipLimitInstruction(job: Job): string {
   if (job.clip_limit) {
     return `Clip limit: return at most ${job.clip_limit} clips. If fewer exist in the video, return only what is genuinely there. Prefer quality over quantity.`;
   }
-  return "";
+  return `Clip limit: none. You MUST completely EXHAUST the video and extract EVERY SINGLE INSTANCE of this action. Do not stop early.`;
 }
 
 export function buildActionExtractionPrompt(job: Job, chunkDurationSec: number): string {

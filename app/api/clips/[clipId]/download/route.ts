@@ -6,25 +6,30 @@ import { getPresignedDownloadUrl } from "@/lib/storage";
 export const runtime = "nodejs";
 
 export async function GET(
-  _req: Request,
+  req: Request,
   context: { params: Promise<{ clipId: string }> },
 ) {
   try {
     const { clipId } = await context.params;
+    const { searchParams } = new URL(req.url);
+    const type = searchParams.get("type");
     const db = createServerClient();
 
     const { data: clip } = await db
       .from("clips")
-      .select("r2_clip_key, title")
+      .select("r2_clip_key, r2_follow_up_clip_key, title")
       .eq("id", clipId)
       .single();
 
-    if (!clip?.r2_clip_key) {
+    const targetKey = type === "followup" ? clip?.r2_follow_up_clip_key : clip?.r2_clip_key;
+
+    if (!targetKey) {
       return NextResponse.json({ error: "Clip not found." }, { status: 404 });
     }
 
-    const filename = `${clip.title ?? "clip"}.mp4`;
-    const url = await getPresignedDownloadUrl(clip.r2_clip_key, filename);
+    const suffix = type === "followup" ? "_followup" : "";
+    const filename = `${clip?.title ?? "clip"}${suffix}.mp4`;
+    const url = await getPresignedDownloadUrl(targetKey, filename);
     return NextResponse.json({ url });
   } catch (err) {
     return NextResponse.json(

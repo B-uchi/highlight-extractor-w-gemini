@@ -105,6 +105,8 @@ create table if not exists clips (
   jersey_color        text,
   r2_clip_key         text,
   r2_clip_url         text,
+  r2_follow_up_clip_key text,
+  r2_follow_up_clip_url text,
   created_at          timestamptz not null default now()
 );
 

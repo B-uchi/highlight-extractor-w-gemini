@@ -50,8 +50,8 @@ function ClipResultCard({
 }) {
   const isCompilation = job.mode !== "action_extraction";
   const label = isCompilation
-    ? `Highlight reel ready — ${clips.length} play${clips.length !== 1 ? "s" : ""}`
-    : `${clips.length} clip${clips.length !== 1 ? "s" : ""} found`;
+    ? `Agent done: Highlight reel ready — ${clips.length} play${clips.length !== 1 ? "s" : ""}`
+    : `Agent done: ${clips.length} clip${clips.length !== 1 ? "s" : ""} found`;
 
   return (
     <div className="flex justify-start">

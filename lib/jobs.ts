@@ -116,30 +116,49 @@ async function extractAndUploadClip(
   id: string;
   r2_clip_key: string;
   r2_clip_url: string;
+  r2_follow_up_clip_key: string | null;
+  r2_follow_up_clip_url: string | null;
   start_sec: number;
   end_sec: number;
   follow_up_end_sec: number | null;
 }> {
   const clipId = randomUUID();
-  const tmpOut = path.join(process.cwd(), "tmp", jobId, `clip_${clipIndex}.mp4`);
+  const tmpOutMain = path.join(process.cwd(), "tmp", jobId, `clip_${clipIndex}.mp4`);
+  const tmpOutFollowUp = followUpSecs ? path.join(process.cwd(), "tmp", jobId, `clip_${clipIndex}_followup.mp4`) : null;
 
   const cutStart = Math.max(0, clip.start_sec - PRE_ACTION_PAD);
   const naturalEnd = clip.end_sec + POST_ACTION_PAD;
-  const cutEnd = followUpSecs ? naturalEnd + followUpSecs : naturalEnd;
   const followUpEndSec = followUpSecs ? naturalEnd + followUpSecs : null;
 
-  await cutClip(sourcePath, cutStart, cutEnd, tmpOut);
+  // Cut main clip
+  await cutClip(sourcePath, cutStart, naturalEnd, tmpOutMain);
+
+  let r2FollowUpKey: string | null = null;
+  let r2FollowUpUrl: string | null = null;
+
+  if (followUpSecs && tmpOutFollowUp && followUpEndSec) {
+    // Cut follow-up clip separately
+    await cutClip(sourcePath, naturalEnd, followUpEndSec, tmpOutFollowUp);
+  }
 
   const r2Key = `clips/${conversationId}/${jobId}/${clip.rank}-${clipId}.mp4`;
-  await uploadFileToR2(tmpOut, r2Key);
-  await safeUnlink(tmpOut);
-
+  await uploadFileToR2(tmpOutMain, r2Key);
+  await safeUnlink(tmpOutMain);
   const url = await getPresignedUrl(r2Key);
+
+  if (followUpSecs && tmpOutFollowUp) {
+    r2FollowUpKey = `clips/${conversationId}/${jobId}/${clip.rank}-${clipId}-followup.mp4`;
+    await uploadFileToR2(tmpOutFollowUp, r2FollowUpKey);
+    await safeUnlink(tmpOutFollowUp);
+    r2FollowUpUrl = await getPresignedUrl(r2FollowUpKey);
+  }
 
   return {
     id: clipId,
     r2_clip_key: r2Key,
     r2_clip_url: url,
+    r2_follow_up_clip_key: r2FollowUpKey,
+    r2_follow_up_clip_url: r2FollowUpUrl,
     start_sec: cutStart,
     end_sec: naturalEnd,
     follow_up_end_sec: followUpEndSec,
@@ -265,6 +284,8 @@ export async function processJob(jobId: string): Promise<void> {
       jersey_color: string | null;
       r2_clip_key: string;
       r2_clip_url: string;
+      r2_follow_up_clip_key: string | null;
+      r2_follow_up_clip_url: string | null;
     }[] = [];
 
     for (let i = 0; i < mergedClips.length; i += MAX_CLIP_PARALLELISM) {
@@ -294,6 +315,8 @@ export async function processJob(jobId: string): Promise<void> {
             jersey_color: clip.jerseyColor ?? null,
             r2_clip_key: uploaded.r2_clip_key,
             r2_clip_url: uploaded.r2_clip_url,
+            r2_follow_up_clip_key: uploaded.r2_follow_up_clip_key,
+            r2_follow_up_clip_url: uploaded.r2_follow_up_clip_url,
           });
           await setJobStatus(jobId, { clips_done: clipRows.length });
         }),
