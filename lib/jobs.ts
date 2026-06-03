@@ -14,7 +14,7 @@ import {
 } from "@/lib/storage";
 import type { GeminiClipResult, Job } from "@/lib/types";
 
-const MAX_CLIP_PARALLELISM = 3;
+const MAX_CLIP_PARALLELISM = 1;
 const BOUNDARY_DEDUP_SEC = 10;
 
 // ── Job status helpers ────────────────────────────────────────────────────────
