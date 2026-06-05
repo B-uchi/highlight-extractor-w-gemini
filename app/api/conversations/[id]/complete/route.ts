@@ -20,6 +20,22 @@ export const runtime = "nodejs";
 // moved to a long-running Railway container there is no ceiling.
 export const maxDuration = 300;
 
+// Emits a heartbeat event every intervalMs while fn is running, keeping Railway's
+// HTTP/2 proxy from closing the stream during long silent operations.
+async function withHeartbeat(
+  emit: (event: UploadProgressEvent) => void,
+  message: string,
+  fn: () => Promise<unknown>,
+  intervalMs = 15_000,
+): Promise<void> {
+  const timer = setInterval(() => emit({ step: "heartbeat", message }), intervalMs);
+  try {
+    await fn();
+  } finally {
+    clearInterval(timer);
+  }
+}
+
 function makeStream(
   handler: (emit: (event: UploadProgressEvent) => void) => Promise<void>,
 ): Response {
@@ -73,12 +89,14 @@ export async function POST(
 
     try {
       // Pull the raw upload back from R2
-      // emit({ step: "preprocessing", message: "Fetching uploaded video..." });
-      await downloadFromR2(rawKey, rawPath);
+      emit({ step: "preprocessing", message: "Fetching uploaded video..." });
+      await withHeartbeat(emit, "Fetching uploaded video...",
+        () => downloadFromR2(rawKey, rawPath));
 
       // Transcode to 720p H.264
       emit({ step: "preprocessing", message: "Transcoding..." });
-      await preprocessVideo(rawPath, processedPath);
+      await withHeartbeat(emit, "Transcoding...",
+        () => preprocessVideo(rawPath, processedPath));
       await rm(rawPath, { force: true });
 
       const durationSecs = await getVideoDuration(processedPath);
@@ -86,7 +104,8 @@ export async function POST(
       // Store the processed video at the canonical key
       emit({ step: "uploading_r2", message: "Processing..." });
       const r2Key = `videos/${id}/${Date.now()}.mp4`;
-      await uploadFileToR2(processedPath, r2Key);
+      await withHeartbeat(emit, "Processing...",
+        () => uploadFileToR2(processedPath, r2Key));
 
       const title = originalFilename.replace(/\.[^/.]+$/, "");
       await db.from("conversations").update({

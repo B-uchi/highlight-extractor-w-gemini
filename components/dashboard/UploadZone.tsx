@@ -134,6 +134,7 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
           if (!line.trim()) continue;
           try {
             const event = JSON.parse(line) as UploadProgressEvent;
+            if (event.step === "heartbeat") continue;
             if (event.step === "error") {
               sawError = true;
               setStep({ key: "error", message: event.error ?? event.message });

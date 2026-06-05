@@ -132,7 +132,8 @@ export type UploadProgressStep =
   | "uploading_r2"
   | "uploading_gemini"
   | "done"
-  | "error";
+  | "error"
+  | "heartbeat";
 
 export interface UploadProgressEvent {
   step: UploadProgressStep;
