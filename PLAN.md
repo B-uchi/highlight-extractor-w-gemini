@@ -233,7 +233,7 @@ is being replaced with a simpler direct-Gemini approach.
 **1.3 Updated Environment Variables**
 ```
 # Supabase
-SUPABASE_URL=
+NEXT_PUBLIC_SUPABASE_URL=
 SUPABASE_ANON_KEY=
 SUPABASE_SERVICE_ROLE_KEY=
 

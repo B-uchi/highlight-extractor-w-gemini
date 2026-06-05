@@ -35,8 +35,8 @@ export const appConfig = {
     presignExpiresIn: Number(process.env.R2_PRESIGN_EXPIRES_SEC ?? 3600),
   },
   supabase: {
-    url: process.env.SUPABASE_URL ?? "",
-    anonKey: process.env.SUPABASE_ANON_KEY ?? "",
+    url: process.env.NEXT_PUBLIC_SUPABASE_URL ?? "",
+    anonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "",
     serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY ?? "",
   },
   cron: {
