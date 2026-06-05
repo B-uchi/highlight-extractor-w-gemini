@@ -4,14 +4,14 @@ import path from "node:path";
 import { db } from "./db";
 import { downloadFromR2, uploadFileToR2, deleteFromR2 } from "./storage";
 import { preprocessVideo, getVideoDuration } from "./ffmpeg";
+import { processJob } from "./jobs";
 import { config } from "./config";
 
-const TMP_ROOT = "/tmp/preprocessing";
+const PREPROCESSING_TMP = "/tmp/preprocessing";
 
-// ── Job processor ─────────────────────────────────────────────────────────────
+// ── Preprocessing job processor ───────────────────────────────────────────────
 
-async function processJob(jobId: string): Promise<void> {
-  // Mark as processing (atomic — prevents double-pickup)
+async function processPreprocessingJob(jobId: string): Promise<void> {
   const { data: job, error: claimErr } = await db
     .from("video_preprocessing_jobs")
     .update({ status: "processing", updated_at: new Date().toISOString() })
@@ -20,18 +20,14 @@ async function processJob(jobId: string): Promise<void> {
     .select()
     .single();
 
-  if (claimErr || !job) {
-    // Another worker instance claimed it first — nothing to do.
-    return;
-  }
+  if (claimErr || !job) return;
 
-  console.log(`[worker] processing job ${jobId} for conversation ${job.conversation_id}`);
+  console.log(`[worker] preprocessing job ${jobId} for conversation ${job.conversation_id}`);
 
-  const tmpDir = path.join(TMP_ROOT, jobId);
+  const tmpDir = path.join(PREPROCESSING_TMP, jobId);
   const rawPath = path.join(tmpDir, "raw");
   const processedPath = path.join(tmpDir, "processed.mp4");
 
-  // Convenience: stamp current step on the job row so the frontend can track real progress.
   async function setStep(step: "downloading" | "transcoding" | "uploading" | "done") {
     await db
       .from("video_preprocessing_jobs")
@@ -42,7 +38,7 @@ async function processJob(jobId: string): Promise<void> {
   try {
     await mkdir(tmpDir, { recursive: true });
 
-    console.log(`[worker] downloading raw video from R2: ${job.r2_raw_key}`);
+    console.log(`[worker] downloading raw video: ${job.r2_raw_key}`);
     await setStep("downloading");
     await downloadFromR2(job.r2_raw_key, rawPath);
 
@@ -55,13 +51,12 @@ async function processJob(jobId: string): Promise<void> {
     console.log(`[worker] duration: ${durationSecs}s`);
 
     const r2Key = `videos/${job.conversation_id}/${Date.now()}.mp4`;
-    console.log(`[worker] uploading processed video to R2: ${r2Key}`);
+    console.log(`[worker] uploading processed video: ${r2Key}`);
     await setStep("uploading");
     await uploadFileToR2(processedPath, r2Key);
 
     const title = job.original_filename.replace(/\.[^/.]+$/, "");
 
-    // Mark conversation active — frontend Realtime listener triggers off this.
     await db.from("conversations").update({
       r2_video_key: r2Key,
       video_filename: job.original_filename,
@@ -72,7 +67,6 @@ async function processJob(jobId: string): Promise<void> {
       updated_at: new Date().toISOString(),
     }).eq("id", job.conversation_id);
 
-    // Clean up raw upload from R2 (best-effort)
     await deleteFromR2(job.r2_raw_key).catch((e: Error) =>
       console.warn(`[worker] failed to delete raw R2 key: ${e.message}`),
     );
@@ -83,10 +77,10 @@ async function processJob(jobId: string): Promise<void> {
       updated_at: new Date().toISOString(),
     }).eq("id", jobId);
 
-    console.log(`[worker] job ${jobId} done`);
+    console.log(`[worker] preprocessing job ${jobId} done`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error(`[worker] job ${jobId} failed: ${message}`);
+    console.error(`[worker] preprocessing job ${jobId} failed: ${message}`);
 
     await db.from("video_preprocessing_jobs").update({
       status: "error",
@@ -94,7 +88,6 @@ async function processJob(jobId: string): Promise<void> {
       updated_at: new Date().toISOString(),
     }).eq("id", jobId);
 
-    // Surface the error to the frontend via the conversation row.
     await db.from("conversations").update({
       preprocessing_error: `Processing failed: ${message}`,
       updated_at: new Date().toISOString(),
@@ -104,38 +97,60 @@ async function processJob(jobId: string): Promise<void> {
   }
 }
 
-// ── Startup drain ─────────────────────────────────────────────────────────────
-// Pick up any pending jobs that arrived before this process started, or
-// jobs that were left in 'processing' state by a crashed previous instance.
+// ── Startup drains ────────────────────────────────────────────────────────────
 
-async function drainPending(): Promise<void> {
+async function drainPreprocessing(): Promise<void> {
   const stuckBefore = new Date(Date.now() - 5 * 60 * 1000).toISOString();
 
   const { data: jobs } = await db
     .from("video_preprocessing_jobs")
-    .select("id")
+    .select("id, status")
     .or(`status.eq.pending,and(status.eq.processing,updated_at.lt.${stuckBefore})`)
     .limit(20);
 
   if (!jobs || jobs.length === 0) return;
 
-  console.log(`[worker] draining ${jobs.length} pending/stuck job(s)`);
+  console.log(`[worker] draining ${jobs.length} preprocessing job(s)`);
   for (const j of jobs) {
-    // Reset stuck 'processing' jobs back to pending so the claim check inside
-    // processJob can succeed.
     await db
       .from("video_preprocessing_jobs")
       .update({ status: "pending", updated_at: new Date().toISOString() })
       .eq("id", j.id)
       .eq("status", "processing");
 
+    void processPreprocessingJob(j.id);
+  }
+}
+
+async function drainAnalysisJobs(): Promise<void> {
+  const stuckBefore = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+
+  const { data: jobs } = await db
+    .from("jobs")
+    .select("id, status")
+    .or(
+      `status.eq.pending,and(status.in.(extracting_target,analyzing,extracting_clips,stitching),updated_at.lt.${stuckBefore})`,
+    )
+    .limit(10);
+
+  if (!jobs || jobs.length === 0) return;
+
+  console.log(`[worker] draining ${jobs.length} analysis job(s)`);
+  for (const j of jobs) {
+    // Reset stuck non-pending jobs so the atomic claim inside processJob succeeds.
+    if (j.status !== "pending") {
+      await db
+        .from("jobs")
+        .update({ status: "pending", updated_at: new Date().toISOString() })
+        .eq("id", j.id);
+    }
     void processJob(j.id);
   }
 }
 
-// ── Realtime subscription ─────────────────────────────────────────────────────
+// ── Realtime subscriptions ────────────────────────────────────────────────────
 
-function subscribeToQueue(): void {
+function subscribeToPreprocessingQueue(): void {
   db
     .channel("preprocessing-queue")
     .on(
@@ -144,39 +159,67 @@ function subscribeToQueue(): void {
       (payload) => {
         const row = payload.new as { id: string; status: string };
         if (row.status === "pending") {
-          console.log(`[worker] realtime: new job ${row.id}`);
+          console.log(`[worker] realtime: preprocessing job ${row.id}`);
+          void processPreprocessingJob(row.id);
+        }
+      },
+    )
+    .subscribe((status) => {
+      console.log(`[worker] preprocessing-queue channel: ${status}`);
+    });
+}
+
+function subscribeToJobQueue(): void {
+  db
+    .channel("job-queue")
+    .on(
+      "postgres_changes",
+      { event: "INSERT", schema: "public", table: "jobs" },
+      (payload) => {
+        const row = payload.new as { id: string; status: string };
+        if (row.status === "pending") {
+          console.log(`[worker] realtime: analysis job ${row.id}`);
           void processJob(row.id);
         }
       },
     )
     .subscribe((status) => {
-      console.log(`[worker] realtime channel: ${status}`);
+      console.log(`[worker] job-queue channel: ${status}`);
     });
 }
 
-// ── Poll fallback ─────────────────────────────────────────────────────────────
-// Catches anything Realtime missed (reconnects, brief disconnects, etc.)
+// ── Poll fallbacks ────────────────────────────────────────────────────────────
 
-function startPollFallback(): void {
+function startPollFallbacks(): void {
   setInterval(async () => {
-    const { data: jobs } = await db
+    const { data: preprocessingJobs } = await db
       .from("video_preprocessing_jobs")
       .select("id")
       .eq("status", "pending")
       .limit(5);
+    for (const j of preprocessingJobs ?? []) void processPreprocessingJob(j.id);
 
-    for (const j of jobs ?? []) {
-      void processJob(j.id);
-    }
+    const { data: analysisJobs } = await db
+      .from("jobs")
+      .select("id")
+      .eq("status", "pending")
+      .limit(3);
+    for (const j of analysisJobs ?? []) void processJob(j.id);
   }, config.pollIntervalMs);
 }
 
 // ── Public start ──────────────────────────────────────────────────────────────
 
 export async function startWorker(): Promise<void> {
-  await mkdir(TMP_ROOT, { recursive: true });
-  await drainPending();
-  subscribeToQueue();
-  startPollFallback();
+  await mkdir(PREPROCESSING_TMP, { recursive: true });
+  await mkdir("/tmp/jobs", { recursive: true });
+
+  await drainPreprocessing();
+  await drainAnalysisJobs();
+
+  subscribeToPreprocessingQueue();
+  subscribeToJobQueue();
+  startPollFallbacks();
+
   console.log(`[worker] ready — polling every ${config.pollIntervalMs / 1000}s`);
 }

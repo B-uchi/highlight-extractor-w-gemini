@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import path from "node:path";
 
 let _bin: string | null = null;
@@ -60,4 +61,86 @@ export async function getVideoDuration(filePath: string): Promise<number> {
     });
     child.on("error", reject);
   });
+}
+
+/** Extract a time-range from a video using stream copy (no re-encode). Fast, approx keyframe cuts. */
+export async function extractSegment(
+  inputPath: string,
+  startSec: number,
+  durationSec: number,
+  outputPath: string,
+): Promise<void> {
+  await run([
+    "-y",
+    "-ss", String(startSec),
+    "-i", inputPath,
+    "-t", String(durationSec),
+    "-c", "copy",
+    outputPath,
+  ]);
+}
+
+/** Apply slow-motion for Gemini analysis. Audio is stripped. */
+export async function slowdownVideo(
+  inputPath: string,
+  outputPath: string,
+  factor: number,
+): Promise<void> {
+  await run([
+    "-y", "-i", inputPath,
+    "-vf", `setpts=${factor}*PTS`,
+    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+    "-an",
+    outputPath,
+  ]);
+}
+
+/** Cut a clip with frame accuracy using the 2-second pre-seek buffer trick. */
+export async function cutClip(
+  inputPath: string,
+  startSec: number,
+  endSec: number,
+  outputPath: string,
+): Promise<void> {
+  const preBuf = Math.min(2, startSec);
+  const seekTo = startSec - preBuf;
+  const duration = endSec - startSec;
+
+  await run([
+    "-y",
+    "-ss", String(seekTo),
+    "-i", inputPath,
+    "-ss", String(preBuf),
+    "-t", String(duration),
+    "-threads", "2",
+    "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+    "-c:a", "aac", "-b:a", "128k",
+    "-movflags", "+faststart",
+    outputPath,
+  ]);
+}
+
+/** Stitch an ordered list of clip paths into one output file using the concat demuxer. */
+export async function stitchClips(
+  clipPaths: string[],
+  outputPath: string,
+  includeAudio: boolean,
+  concatListPath: string,
+): Promise<void> {
+  const listContent = clipPaths.map((p) => `file '${p}'`).join("\n");
+  await writeFile(concatListPath, listContent, "utf8");
+
+  const audioArgs = includeAudio
+    ? ["-c:a", "aac", "-b:a", "128k"]
+    : ["-an"];
+
+  await run([
+    "-y",
+    "-f", "concat", "-safe", "0",
+    "-i", concatListPath,
+    "-c:v", "libx264", "-preset", "fast", "-crf", "22",
+    ...audioArgs,
+    "-movflags", "+faststart",
+    outputPath,
+  ]);
 }

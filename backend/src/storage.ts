@@ -1,5 +1,5 @@
 import { createReadStream, createWriteStream, statSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, unlink } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
 
@@ -12,6 +12,7 @@ import {
   S3Client,
   UploadPartCommand,
 } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
 import { config } from "./config";
 
@@ -37,8 +38,8 @@ export async function downloadFromR2(key: string, destPath: string): Promise<voi
   await pipeline(result.Body as NodeJS.ReadableStream, createWriteStream(destPath));
 }
 
-const MULTIPART_THRESHOLD = 100 * 1024 * 1024; // 100 MB
-const PART_SIZE = 50 * 1024 * 1024; // 50 MB
+const MULTIPART_THRESHOLD = 100 * 1024 * 1024;
+const PART_SIZE = 50 * 1024 * 1024;
 
 export async function uploadFileToR2(localPath: string, key: string): Promise<void> {
   const client = s3();
@@ -94,4 +95,25 @@ export async function uploadFileToR2(localPath: string, key: string): Promise<vo
 
 export async function deleteFromR2(key: string): Promise<void> {
   await s3().send(new DeleteObjectCommand({ Bucket: config.r2.bucket, Key: key }));
+}
+
+export async function getPresignedUrl(
+  key: string,
+  expiresIn = config.r2.presignExpiresIn,
+): Promise<string> {
+  return getSignedUrl(
+    s3(),
+    new GetObjectCommand({ Bucket: config.r2.bucket, Key: key }),
+    { expiresIn },
+  );
+}
+
+export async function safeUnlink(filePath: string): Promise<void> {
+  try { await unlink(filePath); } catch { /* ignore */ }
+}
+
+export async function ensureTmpDir(subdir: string): Promise<string> {
+  const dir = path.join("/tmp", subdir);
+  await mkdir(dir, { recursive: true });
+  return dir;
 }

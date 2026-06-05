@@ -2,36 +2,23 @@ import path from "node:path";
 
 import { FileState, GoogleGenAI } from "@google/genai";
 
-import { appConfig } from "@/lib/config";
-import { extractSegment, slowdownVideo } from "@/lib/ffmpeg";
-import { createServerClient } from "@/lib/supabase";
-import {
-  downloadFromR2,
-  ensureTmpDir,
-  safeUnlink,
-  uploadFileToR2,
-} from "@/lib/storage";
-import type { GeminiClipResult, PreStepResult, VideoChunk } from "@/lib/types";
-import {
-  buildActionExtractionPrompt,
-  buildCompilationPrompt,
-  PRE_STEP_SYSTEM_PROMPT,
-} from "@/lib/prompts";
-import type { Job } from "@/lib/types";
+import { config } from "./config";
+import { extractSegment, slowdownVideo } from "./ffmpeg";
+import { db } from "./db";
+import { downloadFromR2, ensureTmpDir, safeUnlink } from "./storage";
+import type { GeminiClipResult, PreStepResult, VideoChunk, Job } from "./types";
+import { buildActionExtractionPrompt, buildCompilationPrompt, PRE_STEP_SYSTEM_PROMPT } from "./prompts";
 
 const POLL_INTERVAL_MS = 3_000;
 const POLL_TIMEOUT_MS = 10 * 60_000;
-const CHUNK_DURATION_SEC = appConfig.gemini.chunkDurationSec;
 
 let geminiSingleton: GoogleGenAI | null = null;
 
 function getClient(): GoogleGenAI {
   if (geminiSingleton) return geminiSingleton;
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error("GEMINI_API_KEY is not set.");
   geminiSingleton = new GoogleGenAI({
-    apiKey,
-    httpOptions: { timeout: appConfig.gemini.httpTimeoutMs },
+    apiKey: config.gemini.apiKey,
+    httpOptions: { timeout: config.gemini.httpTimeoutMs },
   });
   return geminiSingleton;
 }
@@ -40,7 +27,6 @@ async function sleep(ms: number) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
-/** Upload a local file to Gemini Files API and wait for ACTIVE state. Returns the file URI. */
 async function uploadAndWait(
   filePath: string,
 ): Promise<{ fileUri: string; expiresAt: Date }> {
@@ -57,7 +43,6 @@ async function uploadAndWait(
   while (Date.now() - start < POLL_TIMEOUT_MS) {
     latest = await ai.files.get({ name: uploaded.name });
     if (latest.state === FileState.ACTIVE) {
-      // Prefer the URI from the response; fall back to constructing from name
       const uri =
         latest.uri ??
         `https://generativelanguage.googleapis.com/v1beta/${latest.name}`;
@@ -76,28 +61,15 @@ async function uploadAndWait(
   throw new Error(`Timed out waiting for Gemini file: ${uploaded.name}`);
 }
 
-/**
- * Ensure all video chunks for a conversation are uploaded and active in Gemini.
- * Re-uploads any expired/expiring chunks from R2.
- * Returns ordered array of { chunkIndex, geminiFileId }.
- */
 export async function ensureChunksReady(
   conversationId: string,
   r2VideoKey: string,
   videoDurationSecs: number,
-): Promise<
-  {
-    chunkIndex: number;
-    geminiFileId: string;
-    startSec: number;
-    endSec: number;
-  }[]
-> {
-  const db = createServerClient();
+): Promise<{ chunkIndex: number; geminiFileId: string; startSec: number; endSec: number }[]> {
   const now = new Date();
-  const expiryBuffer = 60 * 60 * 1000; // 1 hour
+  const expiryBuffer = 60 * 60 * 1000;
+  const CHUNK_DURATION_SEC = config.gemini.chunkDurationSec;
 
-  // Load existing chunks
   const { data: existingChunks } = await db
     .from("video_chunks")
     .select("*")
@@ -105,15 +77,9 @@ export async function ensureChunksReady(
     .order("chunk_index");
 
   const chunkCount = Math.ceil(videoDurationSecs / CHUNK_DURATION_SEC);
-  const result: {
-    chunkIndex: number;
-    geminiFileId: string;
-    startSec: number;
-    endSec: number;
-  }[] = [];
+  const result: { chunkIndex: number; geminiFileId: string; startSec: number; endSec: number }[] = [];
 
-  // Download the source video once if any chunk needs re-upload
-  const tmpBase = await ensureTmpDir(conversationId);
+  const tmpBase = await ensureTmpDir(`gemini-${conversationId}`);
   const srcPath = path.join(tmpBase, "source.mp4");
   let srcDownloaded = false;
 
@@ -126,7 +92,6 @@ export async function ensureChunksReady(
     const endSec = Math.min((i + 1) * CHUNK_DURATION_SEC, videoDurationSecs);
     const existing = chunksMap.get(i);
 
-    // Treat old-format IDs (e.g. "files/abc123" stored before the URI fix) as needing re-upload.
     const storedId = existing?.gemini_file_id ?? null;
     const isOldFormat = storedId !== null && !storedId.startsWith("https://");
 
@@ -134,30 +99,22 @@ export async function ensureChunksReady(
       !storedId ||
       isOldFormat ||
       !existing?.gemini_expires_at ||
-      new Date(existing.gemini_expires_at).getTime() - now.getTime() <
-        expiryBuffer;
+      new Date(existing.gemini_expires_at).getTime() - now.getTime() < expiryBuffer;
 
     if (!needsUpload && storedId) {
-      result.push({
-        chunkIndex: i,
-        geminiFileId: storedId,
-        startSec,
-        endSec,
-      });
+      result.push({ chunkIndex: i, geminiFileId: storedId, startSec, endSec });
       continue;
     }
 
-    // Download source video if not yet done
     if (!srcDownloaded) {
       await downloadFromR2(r2VideoKey, srcPath);
       srcDownloaded = true;
     }
 
-    // Extract chunk at normal speed, then slow it down for Gemini
     const chunkPath = path.join(tmpBase, `chunk_${i}.mp4`);
     await extractSegment(srcPath, startSec, endSec - startSec, chunkPath);
 
-    const slowdown = appConfig.gemini.videoSlowdownFactor;
+    const slowdown = config.gemini.videoSlowdownFactor;
     let uploadPath = chunkPath;
     const slowedPath = path.join(tmpBase, `chunk_${i}_slowed.mp4`);
     if (slowdown > 1) {
@@ -169,7 +126,6 @@ export async function ensureChunksReady(
     const { fileUri, expiresAt } = await uploadAndWait(uploadPath);
     await safeUnlink(uploadPath);
 
-    // Upsert DB row
     await db.from("video_chunks").upsert(
       {
         conversation_id: conversationId,
@@ -184,7 +140,6 @@ export async function ensureChunksReady(
     );
 
     await safeUnlink(chunkPath);
-
     result.push({ chunkIndex: i, geminiFileId: fileUri, startSec, endSec });
   }
 
@@ -193,7 +148,6 @@ export async function ensureChunksReady(
   return result;
 }
 
-/** Run the pre-step classification with Gemini Flash Lite. */
 export async function extractTarget(prompt: string): Promise<PreStepResult> {
   const ai = getClient();
   const response = await ai.models.generateContent({
@@ -201,9 +155,7 @@ export async function extractTarget(prompt: string): Promise<PreStepResult> {
     contents: [
       {
         role: "user",
-        parts: [
-          { text: `${PRE_STEP_SYSTEM_PROMPT}\n\nUser prompt: "${prompt}"` },
-        ],
+        parts: [{ text: `${PRE_STEP_SYSTEM_PROMPT}\n\nUser prompt: "${prompt}"` }],
       },
     ],
     config: { responseMimeType: "application/json" },
@@ -234,11 +186,6 @@ export async function extractTarget(prompt: string): Promise<PreStepResult> {
   }
 }
 
-/**
- * Analyze a single chunk with Gemini.
- * geminiFileUri  – full URI stored in DB (e.g. https://...googleapis.com/v1beta/files/XYZ)
- * chunkDurationSec – actual duration of this segment in seconds (used to ground timestamps)
- */
 export async function analyzeChunk(
   geminiFileUri: string,
   job: Job,
@@ -258,11 +205,8 @@ export async function analyzeChunk(
         role: "user",
         parts: [
           {
-            fileData: {
-              fileUri: geminiFileUri,
-              mimeType: "video/mp4",
-            },
-            videoMetadata: { fps: appConfig.gemini.analysisFps },
+            fileData: { fileUri: geminiFileUri, mimeType: "video/mp4" },
+            videoMetadata: { fps: config.gemini.analysisFps },
           },
           { text: systemPrompt },
         ],

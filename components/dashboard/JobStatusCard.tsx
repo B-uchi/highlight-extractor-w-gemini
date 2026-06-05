@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { Loader2, CheckCircle, XCircle, Ban } from "lucide-react";
 
 import type { Clip, Job } from "@/lib/types";
+import { getBrowserClient } from "@/lib/supabase";
 
 interface JobStatusCardProps {
   jobId: string;
@@ -44,32 +45,68 @@ function isCompilation(mode: Job["mode"]) {
 export function JobStatusCard({ jobId, onSettled }: JobStatusCardProps) {
   const [job, setJob] = useState<Job | null>(null);
   const settled = useRef(false);
+  const channelRef = useRef<ReturnType<ReturnType<typeof getBrowserClient>["channel"]> | null>(null);
 
   useEffect(() => {
     if (settled.current) return;
-    let cancelled = false;
 
-    async function poll() {
-      while (!cancelled && !settled.current) {
-        try {
-          const res = await fetch(`/api/jobs/${jobId}`);
-          if (res.ok) {
-            const data = await res.json() as { job: Job; clips: Clip[] };
-            setJob(data.job);
-            if (TERMINAL.includes(data.job.status)) {
-              settled.current = true;
-              onSettled(data.job, data.clips);
-              return;
-            }
-          }
-        } catch {
-          // ignore transient errors
-        }
-        await new Promise((r) => setTimeout(r, 2000));
-      }
+    function settle(j: Job, clips: Clip[] = []) {
+      if (settled.current) return;
+      settled.current = true;
+      channelRef.current?.unsubscribe();
+      channelRef.current = null;
+      onSettled(j, clips);
     }
-    void poll();
-    return () => { cancelled = true; };
+
+    // Race-check: fetch current state right after subscribing in case the job
+    // already settled before the Realtime subscription landed.
+    async function syncCurrent() {
+      try {
+        const res = await fetch(`/api/jobs/${jobId}`);
+        if (!res.ok) return;
+        const data = await res.json() as { job: Job; clips: Clip[] };
+        if (settled.current) return;
+        setJob(data.job);
+        if (TERMINAL.includes(data.job.status)) {
+          settle(data.job, data.clips);
+        }
+      } catch { /* ignore transient errors */ }
+    }
+
+    const supabase = getBrowserClient();
+
+    const channel = supabase
+      .channel(`job-${jobId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "jobs",
+          filter: `id=eq.${jobId}`,
+        },
+        (payload) => {
+          if (settled.current) return;
+          const updated = payload.new as Job;
+          setJob(updated);
+          if (TERMINAL.includes(updated.status)) {
+            // Fetch final clips from API on terminal so onSettled has them.
+            fetch(`/api/jobs/${jobId}`)
+              .then((r) => r.json() as Promise<{ job: Job; clips: Clip[] }>)
+              .then((data) => settle(data.job, data.clips))
+              .catch(() => settle(updated, []));
+          }
+        },
+      )
+      .subscribe(() => {
+        void syncCurrent();
+      });
+
+    channelRef.current = channel;
+    return () => {
+      channel.unsubscribe();
+      channelRef.current = null;
+    };
   }, [jobId, onSettled]);
 
   if (!job) {

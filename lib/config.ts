@@ -3,8 +3,9 @@
 //   N × S × F × 258 tokens
 // Stay under 900K tokens (90% of 1M context):
 //   N ≤ 900_000 / (S × F × 258)
-// Default S=4, F=3 → N ≤ 900_000 / (4 × 3 × 258) = 290s ≈ 4.8 min per chunk
-// For a 90-min broadcast: ~18 chunks (analysed in parallel batches of 3)
+// Default S=2, F=3 → N ≤ 900_000 / (2 × 3 × 258) = 581s ≈ 9.7 min per chunk
+// Slowed chunk uploaded to Gemini = 9.7 × 2 = 19.4 min of video at 3fps
+// For a 90-min game: ~10 chunks (analysed in parallel batches of 3)
 
 const slowdown = Number(process.env.GEMINI_VIDEO_SLOWDOWN ?? 2);
 const analysisFps = Number(process.env.GEMINI_ANALYSIS_FPS ?? 3);
@@ -12,7 +13,9 @@ const autoChunkSec = Math.floor(900_000 / (slowdown * analysisFps * 258));
 
 export const appConfig = {
   gemini: {
-    httpTimeoutMs: Math.max(10_000, Number(process.env.GEMINI_HTTP_TIMEOUT_MS ?? 300_000)),
+    // 2.5 Pro on a ~900K-token chunk can take 5–8 min to respond. 12 min gives
+    // breathing room so a single slow call doesn't kill the whole job.
+    httpTimeoutMs: Math.max(10_000, Number(process.env.GEMINI_HTTP_TIMEOUT_MS ?? 720_000)),
     // Max ORIGINAL-time seconds per chunk. Auto-calculated from token budget unless overridden.
     chunkDurationSec: Number(process.env.GEMINI_CHUNK_DURATION_SEC ?? autoChunkSec),
     analysisParallelism: Number(process.env.GEMINI_ANALYSIS_PARALLELISM ?? 3),
