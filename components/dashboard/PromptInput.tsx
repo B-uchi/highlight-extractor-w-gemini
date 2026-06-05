@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Send, ChevronDown, Plus, X } from "lucide-react";
+import { Send, Plus, X, ChevronDown } from "lucide-react";
 
 import { DEFAULT_PROCESSING_ACTIONS } from "@/lib/defaultActions";
 
@@ -13,13 +13,14 @@ interface PromptInputProps {
 
 const CLIP_LIMIT_OPTIONS = [
   { label: "All clips", value: null },
-  { label: "5 clips", value: 5 },
-  { label: "10 clips", value: 10 },
-  { label: "15 clips", value: 15 },
-  { label: "20 clips", value: 20 },
+  { label: "5 clips",   value: 5   },
+  { label: "10 clips",  value: 10  },
+  { label: "15 clips",  value: 15  },
+  { label: "20 clips",  value: 20  },
 ];
 
-// Matches [Word] or [Multiple Words] — unfilled template placeholders
+const FOLLOW_UP_PRESETS = [3, 5, 10, 15];
+
 const PLACEHOLDER_RE = /\[([A-Za-z][A-Za-z\s]*)\]/g;
 
 export function PromptInput({ disabled, disabledReason, onSubmit }: PromptInputProps) {
@@ -31,13 +32,20 @@ export function PromptInput({ disabled, disabledReason, onSubmit }: PromptInputP
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const presetsRef = useRef<HTMLDivElement>(null);
 
-  // Unique unfilled placeholders in current textarea value
   const unfilled = useMemo(
     () => [...new Set([...prompt.matchAll(PLACEHOLDER_RE)].map((m) => m[0]))],
     [prompt],
   );
 
-  // Close popover on outside click
+  // Auto-grow textarea up to max-h-48.
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  }, [prompt]);
+
+  // Close preset popover on outside click.
   useEffect(() => {
     if (!presetsOpen) return;
     function onDown(e: MouseEvent) {
@@ -69,9 +77,11 @@ export function PromptInput({ disabled, disabledReason, onSubmit }: PromptInputP
     setTimeout(() => textareaRef.current?.focus(), 0);
   }
 
+  const clipLabel = clipLimit == null ? "All clips" : `${clipLimit} clips`;
+
   return (
     <div className="border-t border-zinc-800/60 bg-zinc-950 px-4 py-3">
-      <div className="relative mx-auto max-w-2xl space-y-2">
+      <div className="relative mx-auto max-w-3xl space-y-2">
 
         {/* Preset popover */}
         {presetsOpen && (
@@ -116,7 +126,7 @@ export function PromptInput({ disabled, disabledReason, onSubmit }: PromptInputP
             disabled={disabled}
             placeholder={disabledReason ?? "Ask for highlights — e.g. \"show me all dunks\" or \"highlight reel for #23\""}
             rows={2}
-            className="w-full resize-none rounded-xl bg-transparent px-4 py-3 pr-12 text-sm text-zinc-100 placeholder-zinc-600 outline-none disabled:cursor-not-allowed"
+            className="max-h-48 w-full resize-none overflow-y-auto rounded-xl bg-transparent px-4 py-3 pr-12 text-sm text-zinc-100 placeholder-zinc-600 outline-none disabled:cursor-not-allowed"
           />
           <button
             type="button"
@@ -143,51 +153,72 @@ export function PromptInput({ disabled, disabledReason, onSubmit }: PromptInputP
           </div>
         )}
 
-        {/* Options row */}
+        {/* Toolbar */}
         {!disabled && (
-          <div className="flex flex-wrap items-center gap-3">
-            {/* Preset toggle */}
+          <div className="flex items-center justify-between gap-3">
+
+            {/* Left: Presets */}
             <button
               type="button"
               onClick={() => setPresetsOpen(!presetsOpen)}
-              className={`flex items-center gap-1 text-xs transition-colors ${presetsOpen ? "text-blue-400" : "text-zinc-500 hover:text-zinc-300"}`}
+              className={`flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                presetsOpen
+                  ? "bg-blue-500/15 text-blue-400 ring-1 ring-blue-500/30"
+                  : "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"
+              }`}
             >
               <Plus className="h-3 w-3" />
-              Preset
+              Presets
             </button>
 
-            {/* Follow-up toggle */}
-            <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-500">
-              <input
-                type="checkbox"
-                checked={followUp}
-                onChange={(e) => setFollowUp(e.target.checked)}
-                className="accent-blue-500"
-              />
-              Include follow-up
-              {followUp && (
-                <>
-                  <input
-                    type="number"
-                    min={1}
-                    max={30}
-                    value={followUpSecs}
-                    onChange={(e) => setFollowUpSecs(Math.max(1, Math.min(30, Number(e.target.value))))}
-                    className="w-10 rounded border border-zinc-700 bg-zinc-900 px-1.5 py-0.5 text-center text-xs text-zinc-300 outline-none focus:ring-1 focus:ring-blue-500/50"
-                  />
-                  <span>sec</span>
-                </>
-              )}
-            </label>
+            {/* Right: Follow-up + Clips pills */}
+            <div className="flex items-center gap-2">
 
-            {/* Clip limit */}
-            <div className="relative flex items-center gap-1.5">
-              <label className="text-xs text-zinc-500">Clips:</label>
-              <div className="relative">
+              {/* Follow-up pill */}
+              <div className={`flex items-center rounded-lg ring-1 transition-colors ${
+                followUp
+                  ? "bg-zinc-800 ring-zinc-600"
+                  : "ring-zinc-800 hover:ring-zinc-700"
+              }`}>
+                <button
+                  type="button"
+                  onClick={() => setFollowUp(!followUp)}
+                  className={`px-2.5 py-1.5 text-xs transition-colors ${
+                    followUp ? "text-zinc-200" : "text-zinc-500 hover:text-zinc-400"
+                  }`}
+                >
+                  {followUp ? `Follow-up · ${followUpSecs}s` : "Follow-up"}
+                </button>
+
+                {followUp && (
+                  <>
+                    <div className="h-3.5 w-px bg-zinc-700" />
+                    <div className="flex items-center gap-0.5 px-1.5">
+                      {FOLLOW_UP_PRESETS.map((s) => (
+                        <button
+                          key={s}
+                          type="button"
+                          onClick={() => setFollowUpSecs(s)}
+                          className={`rounded px-1.5 py-0.5 text-[10px] font-mono transition-colors ${
+                            followUpSecs === s
+                              ? "bg-blue-500/20 text-blue-400"
+                              : "text-zinc-600 hover:text-zinc-400"
+                          }`}
+                        >
+                          {s}s
+                        </button>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </div>
+
+              {/* Clips pill */}
+              <div className="relative flex items-center rounded-lg ring-1 ring-zinc-800 hover:ring-zinc-700 transition-colors">
                 <select
                   value={clipLimit ?? "null"}
                   onChange={(e) => setClipLimit(e.target.value === "null" ? null : Number(e.target.value))}
-                  className="appearance-none rounded border border-zinc-700 bg-zinc-900 py-0.5 pl-2 pr-6 text-xs text-zinc-300 outline-none focus:ring-1 focus:ring-blue-500/50"
+                  className="appearance-none cursor-pointer bg-transparent py-1.5 pl-2.5 pr-6 text-xs text-zinc-500 outline-none hover:text-zinc-400"
                 >
                   {CLIP_LIMIT_OPTIONS.map((opt) => (
                     <option key={String(opt.value)} value={opt.value ?? "null"}>
@@ -195,11 +226,10 @@ export function PromptInput({ disabled, disabledReason, onSubmit }: PromptInputP
                     </option>
                   ))}
                 </select>
-                <ChevronDown className="pointer-events-none absolute right-1.5 top-1 h-3 w-3 text-zinc-600" />
+                <ChevronDown className="pointer-events-none absolute right-1.5 top-1/2 h-3 w-3 -translate-y-1/2 text-zinc-600" />
               </div>
-            </div>
 
-            <p className="ml-auto text-[10px] text-zinc-700">Enter to send · Shift+Enter for newline</p>
+            </div>
           </div>
         )}
       </div>
