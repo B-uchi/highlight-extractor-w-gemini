@@ -31,13 +31,23 @@ async function processJob(jobId: string): Promise<void> {
   const rawPath = path.join(tmpDir, "raw");
   const processedPath = path.join(tmpDir, "processed.mp4");
 
+  // Convenience: stamp current step on the job row so the frontend can track real progress.
+  async function setStep(step: "downloading" | "transcoding" | "uploading" | "done") {
+    await db
+      .from("video_preprocessing_jobs")
+      .update({ step, updated_at: new Date().toISOString() })
+      .eq("id", jobId);
+  }
+
   try {
     await mkdir(tmpDir, { recursive: true });
 
     console.log(`[worker] downloading raw video from R2: ${job.r2_raw_key}`);
+    await setStep("downloading");
     await downloadFromR2(job.r2_raw_key, rawPath);
 
     console.log("[worker] transcoding...");
+    await setStep("transcoding");
     await preprocessVideo(rawPath, processedPath);
     await rm(rawPath, { force: true });
 
@@ -46,6 +56,7 @@ async function processJob(jobId: string): Promise<void> {
 
     const r2Key = `videos/${job.conversation_id}/${Date.now()}.mp4`;
     console.log(`[worker] uploading processed video to R2: ${r2Key}`);
+    await setStep("uploading");
     await uploadFileToR2(processedPath, r2Key);
 
     const title = job.original_filename.replace(/\.[^/.]+$/, "");
@@ -66,6 +77,7 @@ async function processJob(jobId: string): Promise<void> {
       console.warn(`[worker] failed to delete raw R2 key: ${e.message}`),
     );
 
+    await setStep("done");
     await db.from("video_preprocessing_jobs").update({
       status: "done",
       updated_at: new Date().toISOString(),

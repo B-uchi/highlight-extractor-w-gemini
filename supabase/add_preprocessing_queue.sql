@@ -8,6 +8,8 @@ create table if not exists video_preprocessing_jobs (
   original_filename text not null default 'video.mp4',
   status            text not null default 'pending'
     check (status in ('pending', 'processing', 'done', 'error')),
+  -- Updated by the worker at each stage so the frontend can show real progress.
+  step              text check (step in ('downloading', 'transcoding', 'uploading', 'done')),
   error_message     text,
   created_at        timestamptz not null default now(),
   updated_at        timestamptz not null default now()

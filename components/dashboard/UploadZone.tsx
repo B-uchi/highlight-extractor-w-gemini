@@ -1,10 +1,20 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Upload, CheckCircle, AlertCircle, Loader2 } from "lucide-react";
+import { Upload, CheckCircle, AlertCircle, Loader2, Check } from "lucide-react";
 
 import { getBrowserClient } from "@/lib/supabase";
 import type { Conversation } from "@/lib/types";
+
+// The `step` values the backend worker stamps on the job row as each stage begins.
+// Order here determines the visual sequence.
+type JobStep = "downloading" | "transcoding" | "uploading" | "done" | null;
+
+const STEPS: { key: NonNullable<Exclude<JobStep, "done">>; label: string }[] = [
+  { key: "downloading", label: "Processing" },
+  { key: "transcoding", label: "Transcoding" },
+  { key: "uploading",   label: "Saving processed video" },
+];
 
 interface UploadZoneProps {
   conversationId: string;
@@ -14,12 +24,10 @@ interface UploadZoneProps {
 type Step =
   | { key: "idle" }
   | { key: "uploading"; current: string; pct: number }
-  | { key: "processing" }
+  | { key: "processing"; jobId: string; jobStep: JobStep }
   | { key: "done" }
   | { key: "error"; message: string };
 
-// PUT a file straight to R2 via a presigned URL, reporting upload progress.
-// Uses XHR because fetch() has no upload-progress events.
 function putToR2(url: string, file: File, onProgress: (pct: number) => void): Promise<void> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
@@ -40,14 +48,10 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [step, setStep] = useState<Step>({ key: "idle" });
   const [dragOver, setDragOver] = useState(false);
-  // Hold the Realtime channel so we can unsubscribe on unmount / completion.
   const channelRef = useRef<ReturnType<ReturnType<typeof getBrowserClient>["channel"]> | null>(null);
 
-  // Clean up Realtime subscription when component unmounts.
   useEffect(() => {
-    return () => {
-      channelRef.current?.unsubscribe();
-    };
+    return () => { channelRef.current?.unsubscribe(); };
   }, []);
 
   function finish() {
@@ -63,13 +67,35 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
     setStep({ key: "error", message });
   }
 
-  // Subscribe to the conversation row. Resolves immediately if already active,
-  // otherwise waits for the backend worker to set status='active'.
-  function subscribeToConversation() {
+  // Subscribe to two rows:
+  // 1. The preprocessing job — for step-by-step progress display.
+  // 2. The conversation — for final completion (status='active') and errors.
+  function subscribeToJob(jobId: string) {
     const supabase = getBrowserClient();
 
     const channel = supabase
-      .channel(`conv-preprocessing-${conversationId}`)
+      .channel(`preprocessing-${jobId}`)
+      // Job row: update the active step as the worker stamps each stage.
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "video_preprocessing_jobs",
+          filter: `id=eq.${jobId}`,
+        },
+        (payload) => {
+          const row = payload.new as { step: JobStep; status: string; error_message: string | null };
+          if (row.status === "error") {
+            showError(row.error_message ?? "Processing failed.");
+            return;
+          }
+          setStep((prev) =>
+            prev.key === "processing" ? { ...prev, jobStep: row.step } : prev,
+          );
+        },
+      )
+      // Conversation row: final activation fires here.
       .on(
         "postgres_changes",
         {
@@ -80,25 +106,32 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
         },
         (payload) => {
           const row = payload.new as Partial<Conversation>;
-          if (row.status === "active") {
-            finish();
-          } else if (row.preprocessing_error) {
-            showError(row.preprocessing_error);
-          }
+          if (row.status === "active") finish();
+          else if (row.preprocessing_error) showError(row.preprocessing_error);
         },
       )
       .subscribe(async (status) => {
         if (status !== "SUBSCRIBED") return;
-        // Check current DB state — the worker may have already finished before
-        // the subscription was established.
-        const { data } = await supabase
+        // Race-check: worker may have already finished before the subscription landed.
+        const { data: conv } = await supabase
           .from("conversations")
           .select("status, preprocessing_error")
           .eq("id", conversationId)
           .single<{ status: string; preprocessing_error: string | null }>();
-        if (!data) return;
-        if (data.status === "active") finish();
-        else if (data.preprocessing_error) showError(data.preprocessing_error);
+        if (conv?.status === "active") { finish(); return; }
+        if (conv?.preprocessing_error) { showError(conv.preprocessing_error); return; }
+
+        // Also sync current job step if the worker already advanced past null.
+        const { data: job } = await supabase
+          .from("video_preprocessing_jobs")
+          .select("step, status, error_message")
+          .eq("id", jobId)
+          .single<{ step: JobStep; status: string; error_message: string | null }>();
+        if (!job) return;
+        if (job.status === "error") { showError(job.error_message ?? "Processing failed."); return; }
+        setStep((prev) =>
+          prev.key === "processing" ? { ...prev, jobStep: job.step } : prev,
+        );
       });
 
     channelRef.current = channel;
@@ -113,7 +146,6 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
     setStep({ key: "uploading", current: "Preparing upload...", pct: 0 });
 
     try {
-      // 1) Get a presigned PUT URL
       const urlRes = await fetch(`/api/conversations/${conversationId}/upload-url`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -125,12 +157,10 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
       }
       const { uploadUrl, key } = (await urlRes.json()) as { uploadUrl: string; key: string };
 
-      // 2) Upload directly to R2
       await putToR2(uploadUrl, file, (pct) =>
         setStep({ key: "uploading", current: `Uploading video... ${pct}%`, pct }),
       );
 
-      // 3) Enqueue preprocessing — returns 202 immediately
       const completeRes = await fetch(`/api/conversations/${conversationId}/complete`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -140,10 +170,10 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
         const { error } = (await completeRes.json().catch(() => ({}))) as { error?: string };
         throw new Error(error ?? "Failed to queue video processing.");
       }
+      const { jobId } = (await completeRes.json()) as { jobId: string };
 
-      // 4) Subscribe to Realtime and wait for backend to finish
-      setStep({ key: "processing" });
-      subscribeToConversation();
+      setStep({ key: "processing", jobId, jobStep: null });
+      subscribeToJob(jobId);
     } catch (err) {
       setStep({ key: "error", message: err instanceof Error ? err.message : "Upload failed." });
     }
@@ -208,14 +238,12 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
           </>
         )}
 
-        {(step.key === "uploading" || step.key === "processing") && (
+        {step.key === "uploading" && (
           <>
             <Loader2 className="h-8 w-8 animate-spin text-blue-400" />
             <div className="w-full space-y-1">
-              <p className="text-sm font-medium text-zinc-100">
-                {step.key === "uploading" ? step.current : "Processing video..."}
-              </p>
-              {step.key === "uploading" && step.pct > 0 && step.pct < 100 && (
+              <p className="text-sm font-medium text-zinc-100">{step.current}</p>
+              {step.pct > 0 && step.pct < 100 && (
                 <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
                   <div
                     className="h-full rounded-full bg-blue-500 transition-all duration-300"
@@ -223,12 +251,41 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
                   />
                 </div>
               )}
-              {step.key === "processing" && (
-                <p className="text-xs text-zinc-600">
-                  Transcoding in the background — you&apos;ll be taken to the chat automatically
-                </p>
-              )}
             </div>
+          </>
+        )}
+
+        {step.key === "processing" && (
+          <>
+            <Loader2 className="h-8 w-8 animate-spin text-blue-400" />
+            <div className="w-full space-y-2.5">
+              {STEPS.map(({ key: stepKey, label }) => {
+                const stepIdx = STEPS.findIndex((s) => s.key === step.jobStep);
+                const thisIdx = STEPS.findIndex((s) => s.key === stepKey);
+                const isDone = stepIdx > thisIdx || step.jobStep === "done";
+                const isActive = step.jobStep === stepKey;
+                return (
+                  <div
+                    key={stepKey}
+                    className={`flex items-center gap-2.5 text-xs transition-colors ${
+                      isDone ? "text-green-400" : isActive ? "text-zinc-200" : "text-zinc-700"
+                    }`}
+                  >
+                    {isDone ? (
+                      <Check className="h-3.5 w-3.5 shrink-0" />
+                    ) : isActive ? (
+                      <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                    ) : (
+                      <div className="h-3.5 w-3.5 shrink-0 rounded-full border border-zinc-800" />
+                    )}
+                    {label}
+                  </div>
+                );
+              })}
+            </div>
+            <p className="text-[10px] text-zinc-700">
+              You&apos;ll be taken to the chat automatically when ready
+            </p>
           </>
         )}
 
