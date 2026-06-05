@@ -24,27 +24,13 @@ export const DEFAULT_PROCESSING_ACTIONS: DefaultProcessingActionDefinition[] = [
     title: "Player Identification Prompt",
     description:
       "Full-game identity brief, required/optional inputs, and example line.",
-    promptTemplate: `Prompt:
-
-"Scan the full game video and identify every player from Team A using jersey color, jersey number, player roster, and uniform design. Track each player throughout the game, even when they move off-ball, are partially blocked, or switch sides of the court."
-
-Required inputs:
-
-Team name
-Jersey color
-Player number
-
-Example:
-
-"Find and track Player #3 on the black Triple Threat Athletics team. Isolate all possessions where #3 is involved in the play, including scoring, assists, rebounds, steals, blocks, defensive stops, ball handling, and transition plays."`,
+    promptTemplate: `Find and track Player [JERSEY_NUMBER] on the [JERSEY_COLOR] jersey/uniform. Isolate all possessions where [JERSEY_NUMBER] is involved in the play, including scoring, assists, rebounds, steals, blocks, defensive stops, ball handling, and transition plays.`,
   },
   {
     id: "highlight_events",
     title: "Highlight Event Detection Prompt",
     description: "Basketball events where the player makes a positive impact.",
-    promptTemplate: `Prompt:
-
-"Create a highlight reel for each player by detecting basketball events where the player makes a positive impact."
+    promptTemplate: `Create a highlight reel for each player by detecting basketball events where the player makes a positive impact.
 
 Events to pull:
 
