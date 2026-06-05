@@ -182,6 +182,20 @@ export async function processJob(jobId: string): Promise<void> {
     job = await getJob(jobId);
     if (!job) return;
 
+    // Reject prompts that still contain unfilled template placeholders like [Player Name]
+    const unfilledTokens = [...job.prompt.matchAll(/\[([A-Za-z][A-Za-z\s]*)\]/g)].map((m) => m[0]);
+    if (unfilledTokens.length > 0) {
+      const unique = [...new Set(unfilledTokens)];
+      await setJobStatus(jobId, { status: "unsupported" });
+      await db.from("messages").insert({
+        conversation_id: job.conversation_id,
+        role: "assistant",
+        content: `Please fill in the template fields before submitting: ${unique.join(", ")}`,
+        job_id: jobId,
+      });
+      return;
+    }
+
     const preStep = await extractTarget(job.prompt);
 
     if (!preStep.supported) {

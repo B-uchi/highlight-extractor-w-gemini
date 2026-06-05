@@ -9,6 +9,7 @@ export interface Conversation {
   r2_video_key: string | null;
   video_filename: string | null;
   video_duration_secs: number | null;
+  preprocessing_error: string | null;
   created_at: string;
   updated_at: string;
   archived_at: string | null;

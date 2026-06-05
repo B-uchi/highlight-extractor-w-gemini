@@ -55,12 +55,15 @@ function run(args: string[], timeoutMs = 30 * 60 * 1000): Promise<void> {
 
 /** Transcode to 720p H.264 + AAC. Returns output path. */
 export async function preprocessVideo(inputPath: string, outputPath: string): Promise<void> {
+  // -movflags +faststart intentionally omitted — it requires FFmpeg to re-open the output
+  // file for a moov-atom shift, which fails on Railway's filesystem for large files.
+  // This video is only ever read by the backend for clip cutting; it doesn't need
+  // progressive-download ordering.
   await run([
     "-y", "-i", inputPath,
     "-vf", "scale=-2:720",
     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
     "-c:a", "aac", "-b:a", "128k",
-    "-movflags", "+faststart",
     outputPath,
   ]);
 }

@@ -1,9 +1,10 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Upload, CheckCircle, AlertCircle, Loader2 } from "lucide-react";
 
-import type { UploadProgressEvent } from "@/lib/types";
+import { getBrowserClient } from "@/lib/supabase";
+import type { Conversation } from "@/lib/types";
 
 interface UploadZoneProps {
   conversationId: string;
@@ -12,21 +13,10 @@ interface UploadZoneProps {
 
 type Step =
   | { key: "idle" }
-  | { key: "uploading"; current: string; events: UploadProgressEvent[] }
+  | { key: "uploading"; current: string; pct: number }
+  | { key: "processing" }
   | { key: "done" }
   | { key: "error"; message: string };
-
-function stepLabel(event: UploadProgressEvent): string {
-  if (event.step === "preprocessing") return event.message;
-  if (event.step === "uploading_r2") return event.message;
-  if (event.step === "uploading_gemini") {
-    return event.totalChunks && event.totalChunks > 1
-      ? `Preparing for analysis (${event.chunk ?? 0}/${event.totalChunks} chunks)...`
-      : "Preparing for analysis...";
-  }
-  if (event.step === "done") return "Ready";
-  return event.message;
-}
 
 // PUT a file straight to R2 via a presigned URL, reporting upload progress.
 // Uses XHR because fetch() has no upload-progress events.
@@ -50,36 +40,68 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [step, setStep] = useState<Step>({ key: "idle" });
   const [dragOver, setDragOver] = useState(false);
+  // Hold the Realtime channel so we can unsubscribe on unmount / completion.
+  const channelRef = useRef<ReturnType<ReturnType<typeof getBrowserClient>["channel"]> | null>(null);
 
-  // Processing holds the connection open while chunks upload to Gemini, which can
-  // outlast a browser/proxy timeout. If the stream dies before "done", fall back
-  // to polling status — the server sets it "active" once the video is stored.
-  async function confirmReadyViaStatus(): Promise<boolean> {
-    for (let attempt = 0; attempt < 10; attempt++) {
-      try {
-        const res = await fetch(`/api/conversations/${conversationId}`, { cache: "no-store" });
-        if (res.ok) {
-          const data = (await res.json()) as { conversation?: { status?: string } };
-          if (data.conversation?.status === "active") return true;
-        }
-      } catch {
-        // transient — retry
-      }
-      await new Promise((r) => setTimeout(r, 1500));
-    }
-    return false;
-  }
+  // Clean up Realtime subscription when component unmounts.
+  useEffect(() => {
+    return () => {
+      channelRef.current?.unsubscribe();
+    };
+  }, []);
 
   function finish() {
+    channelRef.current?.unsubscribe();
+    channelRef.current = null;
     setStep({ key: "done" });
     setTimeout(() => onComplete(), 800);
   }
 
-  function pushEvent(current: string, event?: UploadProgressEvent) {
-    setStep((prev) => {
-      const prevEvents = prev.key === "uploading" ? prev.events : [];
-      return { key: "uploading", current, events: event ? [...prevEvents, event] : prevEvents };
-    });
+  function showError(message: string) {
+    channelRef.current?.unsubscribe();
+    channelRef.current = null;
+    setStep({ key: "error", message });
+  }
+
+  // Subscribe to the conversation row. Resolves immediately if already active,
+  // otherwise waits for the backend worker to set status='active'.
+  function subscribeToConversation() {
+    const supabase = getBrowserClient();
+
+    const channel = supabase
+      .channel(`conv-preprocessing-${conversationId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "conversations",
+          filter: `id=eq.${conversationId}`,
+        },
+        (payload) => {
+          const row = payload.new as Partial<Conversation>;
+          if (row.status === "active") {
+            finish();
+          } else if (row.preprocessing_error) {
+            showError(row.preprocessing_error);
+          }
+        },
+      )
+      .subscribe(async (status) => {
+        if (status !== "SUBSCRIBED") return;
+        // Check current DB state — the worker may have already finished before
+        // the subscription was established.
+        const { data } = await supabase
+          .from("conversations")
+          .select("status, preprocessing_error")
+          .eq("id", conversationId)
+          .single<{ status: string; preprocessing_error: string | null }>();
+        if (!data) return;
+        if (data.status === "active") finish();
+        else if (data.preprocessing_error) showError(data.preprocessing_error);
+      });
+
+    channelRef.current = channel;
   }
 
   async function upload(file: File) {
@@ -88,10 +110,10 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
       return;
     }
 
-    setStep({ key: "uploading", current: "Preparing upload...", events: [] });
+    setStep({ key: "uploading", current: "Preparing upload...", pct: 0 });
 
     try {
-      // 1) Ask the server for a presigned PUT URL
+      // 1) Get a presigned PUT URL
       const urlRes = await fetch(`/api/conversations/${conversationId}/upload-url`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -103,66 +125,26 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
       }
       const { uploadUrl, key } = (await urlRes.json()) as { uploadUrl: string; key: string };
 
-      // 2) Upload the raw file directly to R2 (bypasses the API body limit)
-      pushEvent("Uploading video... 0%");
-      await putToR2(uploadUrl, file, (pct) => pushEvent(`Uploading video... ${pct}%`));
-      pushEvent("Processing video...", { step: "preprocessing", message: "Video uploaded" });
+      // 2) Upload directly to R2
+      await putToR2(uploadUrl, file, (pct) =>
+        setStep({ key: "uploading", current: `Uploading video... ${pct}%`, pct }),
+      );
 
-      // 3) Trigger server-side processing and stream progress
-      let sawDone = false;
-      let sawError = false;
-
-      const res = await fetch(`/api/conversations/${conversationId}/complete`, {
+      // 3) Enqueue preprocessing — returns 202 immediately
+      const completeRes = await fetch(`/api/conversations/${conversationId}/complete`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ key, filename: file.name }),
       });
-
-      const reader = res.body?.getReader();
-      if (!reader) throw new Error("No response body.");
-
-      const decoder = new TextDecoder();
-      let buffer = "";
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const event = JSON.parse(line) as UploadProgressEvent;
-            if (event.step === "heartbeat") continue;
-            if (event.step === "error") {
-              sawError = true;
-              setStep({ key: "error", message: event.error ?? event.message });
-              return;
-            }
-            if (event.step === "done") {
-              sawDone = true;
-              finish();
-              return;
-            }
-            pushEvent(stepLabel(event), event);
-          } catch {
-            // ignore parse errors on partial lines
-          }
-        }
+      if (!completeRes.ok) {
+        const { error } = (await completeRes.json().catch(() => ({}))) as { error?: string };
+        throw new Error(error ?? "Failed to queue video processing.");
       }
 
-      // Stream ended without an explicit done/error — verify via status.
-      if (!sawDone && !sawError) {
-        if (await confirmReadyViaStatus()) finish();
-        else setStep({ key: "error", message: "Processing did not complete. Please try again." });
-      }
+      // 4) Subscribe to Realtime and wait for backend to finish
+      setStep({ key: "processing" });
+      subscribeToConversation();
     } catch (err) {
-      // The connection may have dropped only after the server finished — check status first.
-      if (await confirmReadyViaStatus()) {
-        finish();
-        return;
-      }
       setStep({ key: "error", message: err instanceof Error ? err.message : "Upload failed." });
     }
   }
@@ -178,9 +160,6 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
     const file = e.dataTransfer.files?.[0];
     if (file) void upload(file);
   }
-
-  const events = step.key === "uploading" ? step.events : [];
-  const current = step.key === "uploading" ? step.current : "";
 
   return (
     <div className="flex h-full flex-col items-center justify-center p-8">
@@ -229,23 +208,27 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
           </>
         )}
 
-        {step.key === "uploading" && (
+        {(step.key === "uploading" || step.key === "processing") && (
           <>
             <Loader2 className="h-8 w-8 animate-spin text-blue-400" />
-            <div className="w-full space-y-2">
+            <div className="w-full space-y-1">
               <p className="text-sm font-medium text-zinc-100">
-                {current || "Processing..."}
+                {step.key === "uploading" ? step.current : "Processing video..."}
               </p>
-              <div className="space-y-1">
-                {events.map((ev, i) => (
-                  <div key={i} className="flex items-center gap-2 text-xs text-zinc-500">
-                    <span className="text-green-400">✓</span>
-                    <span>{stepLabel(ev)}</span>
-                  </div>
-                ))}
-              </div>
+              {step.key === "uploading" && step.pct > 0 && step.pct < 100 && (
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+                  <div
+                    className="h-full rounded-full bg-blue-500 transition-all duration-300"
+                    style={{ width: `${step.pct}%` }}
+                  />
+                </div>
+              )}
+              {step.key === "processing" && (
+                <p className="text-xs text-zinc-600">
+                  Transcoding in the background — you&apos;ll be taken to the chat automatically
+                </p>
+              )}
             </div>
-            <p className="text-xs text-zinc-600">This may take a few minutes for large files</p>
           </>
         )}
 
@@ -266,7 +249,7 @@ export function UploadZone({ conversationId, onComplete }: UploadZoneProps) {
             <button
               type="button"
               onClick={() => setStep({ key: "idle" })}
-              className="rounded-lg border border-zinc-700 px-4 py-2 text-sm text-zinc-300 hover:border-zinc-600 transition-colors"
+              className="rounded-lg border border-zinc-700 px-4 py-2 text-xs text-zinc-400 hover:border-zinc-600 hover:text-zinc-300 transition-colors"
             >
               Try again
             </button>
