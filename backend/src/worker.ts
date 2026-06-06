@@ -125,25 +125,30 @@ async function drainPreprocessing(): Promise<void> {
 async function drainAnalysisJobs(): Promise<void> {
   const stuckBefore = new Date(Date.now() - 5 * 60 * 1000).toISOString();
 
-  const { data: jobs } = await db
-    .from("jobs")
-    .select("id, status")
-    .or(
-      `status.eq.pending,and(status.in.(extracting_target,analyzing,extracting_clips,stitching),updated_at.lt.${stuckBefore})`,
-    )
-    .limit(10);
+  const [pendingRes, stuckRes] = await Promise.all([
+    db.from("jobs").select("id").eq("status", "pending").limit(10),
+    db.from("jobs")
+      .select("id")
+      .in("status", ["extracting_target", "analyzing", "extracting_clips", "stitching"])
+      .lt("updated_at", stuckBefore)
+      .limit(10),
+  ]);
 
-  if (!jobs || jobs.length === 0) return;
+  const seen = new Set<string>();
+  const jobs = [...(pendingRes.data ?? []), ...(stuckRes.data ?? [])].filter(
+    (j) => !seen.has(j.id) && seen.add(j.id),
+  );
+
+  if (jobs.length === 0) return;
 
   console.log(`[worker] draining ${jobs.length} analysis job(s)`);
   for (const j of jobs) {
-    // Reset stuck non-pending jobs so the atomic claim inside processJob succeeds.
-    if (j.status !== "pending") {
-      await db
-        .from("jobs")
-        .update({ status: "pending", updated_at: new Date().toISOString() })
-        .eq("id", j.id);
-    }
+    // Reset stuck jobs back to pending so the atomic claim inside processJob succeeds.
+    await db
+      .from("jobs")
+      .update({ status: "pending", updated_at: new Date().toISOString() })
+      .eq("id", j.id)
+      .neq("status", "pending");
     void processJob(j.id);
   }
 }

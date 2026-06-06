@@ -1,4 +1,5 @@
 import path from "node:path";
+import { rm } from "node:fs/promises";
 
 import { FileState, GoogleGenAI } from "@google/genai";
 
@@ -87,65 +88,67 @@ export async function ensureChunksReady(
     (existingChunks ?? []).map((c: VideoChunk) => [c.chunk_index, c]),
   );
 
-  for (let i = 0; i < chunkCount; i++) {
-    const startSec = i * CHUNK_DURATION_SEC;
-    const endSec = Math.min((i + 1) * CHUNK_DURATION_SEC, videoDurationSecs);
-    const existing = chunksMap.get(i);
+  try {
+    for (let i = 0; i < chunkCount; i++) {
+      const startSec = i * CHUNK_DURATION_SEC;
+      const endSec = Math.min((i + 1) * CHUNK_DURATION_SEC, videoDurationSecs);
+      const existing = chunksMap.get(i);
 
-    const storedId = existing?.gemini_file_id ?? null;
-    const isOldFormat = storedId !== null && !storedId.startsWith("https://");
+      const storedId = existing?.gemini_file_id ?? null;
+      const isOldFormat = storedId !== null && !storedId.startsWith("https://");
 
-    const needsUpload =
-      !storedId ||
-      isOldFormat ||
-      !existing?.gemini_expires_at ||
-      new Date(existing.gemini_expires_at).getTime() - now.getTime() < expiryBuffer;
+      const needsUpload =
+        !storedId ||
+        isOldFormat ||
+        !existing?.gemini_expires_at ||
+        new Date(existing.gemini_expires_at).getTime() - now.getTime() < expiryBuffer;
 
-    if (!needsUpload && storedId) {
-      result.push({ chunkIndex: i, geminiFileId: storedId, startSec, endSec });
-      continue;
-    }
+      if (!needsUpload && storedId) {
+        result.push({ chunkIndex: i, geminiFileId: storedId, startSec, endSec });
+        continue;
+      }
 
-    if (!srcDownloaded) {
-      await downloadFromR2(r2VideoKey, srcPath);
-      srcDownloaded = true;
-    }
+      if (!srcDownloaded) {
+        await downloadFromR2(r2VideoKey, srcPath);
+        srcDownloaded = true;
+      }
 
-    const chunkPath = path.join(tmpBase, `chunk_${i}.mp4`);
-    await extractSegment(srcPath, startSec, endSec - startSec, chunkPath);
+      const chunkPath = path.join(tmpBase, `chunk_${i}.mp4`);
+      await extractSegment(srcPath, startSec, endSec - startSec, chunkPath);
 
-    const slowdown = config.gemini.videoSlowdownFactor;
-    let uploadPath = chunkPath;
-    const slowedPath = path.join(tmpBase, `chunk_${i}_slowed.mp4`);
-    if (slowdown > 1) {
-      await slowdownVideo(chunkPath, slowedPath, slowdown);
+      const slowdown = config.gemini.videoSlowdownFactor;
+      let uploadPath = chunkPath;
+      const slowedPath = path.join(tmpBase, `chunk_${i}_slowed.mp4`);
+      if (slowdown > 1) {
+        await slowdownVideo(chunkPath, slowedPath, slowdown);
+        await safeUnlink(chunkPath);
+        uploadPath = slowedPath;
+      }
+
+      const { fileUri, expiresAt } = await uploadAndWait(uploadPath);
+      await safeUnlink(uploadPath);
+
+      await db.from("video_chunks").upsert(
+        {
+          conversation_id: conversationId,
+          chunk_index: i,
+          start_sec: startSec,
+          end_sec: endSec,
+          gemini_file_id: fileUri,
+          gemini_expires_at: expiresAt.toISOString(),
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "conversation_id,chunk_index" },
+      );
+
       await safeUnlink(chunkPath);
-      uploadPath = slowedPath;
+      result.push({ chunkIndex: i, geminiFileId: fileUri, startSec, endSec });
     }
 
-    const { fileUri, expiresAt } = await uploadAndWait(uploadPath);
-    await safeUnlink(uploadPath);
-
-    await db.from("video_chunks").upsert(
-      {
-        conversation_id: conversationId,
-        chunk_index: i,
-        start_sec: startSec,
-        end_sec: endSec,
-        gemini_file_id: fileUri,
-        gemini_expires_at: expiresAt.toISOString(),
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "conversation_id,chunk_index" },
-    );
-
-    await safeUnlink(chunkPath);
-    result.push({ chunkIndex: i, geminiFileId: fileUri, startSec, endSec });
+    return result;
+  } finally {
+    await rm(tmpBase, { recursive: true, force: true }).catch(() => {});
   }
-
-  if (srcDownloaded) await safeUnlink(srcPath);
-
-  return result;
 }
 
 export async function extractTarget(prompt: string): Promise<PreStepResult> {
