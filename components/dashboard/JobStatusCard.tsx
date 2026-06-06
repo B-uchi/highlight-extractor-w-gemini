@@ -6,6 +6,11 @@ import { Loader2, CheckCircle, XCircle, Ban } from "lucide-react";
 import type { Clip, Job } from "@/lib/types";
 import { getBrowserClient } from "@/lib/supabase";
 
+const SLOW_HINT_DELAY_MS = 45_000;
+const SLOW_HINT_ON_MS = 10_000;
+const SLOW_HINT_OFF_MS = 5_000;
+const SLOW_HINT_CYCLE_MS = SLOW_HINT_ON_MS + SLOW_HINT_OFF_MS;
+
 interface JobStatusCardProps {
   jobId: string;
   onSettled: (job: Job, clips: Clip[]) => void;
@@ -18,13 +23,13 @@ function statusLabel(job: Job): string {
     case "pending": return "Queued...";
     case "extracting_target": return "Reading your prompt...";
     case "analyzing":
-      return job.clips_total == null
-        ? "Analyzing video..."
-        : `Analyzing video (chunk by chunk)...`;
+      return job.chunks_total != null
+        ? `Analyzing video (${job.chunks_analyzed}/${job.chunks_total} chunks)...`
+        : "Analyzing video...";
     case "extracting_clips":
       return `Cutting clips (${job.clips_done}/${job.clips_total ?? "?"})...`;
     case "stitching": return "Stitching highlight reel...";
-    case "done": return `Done`;
+    case "done": return "Done";
     case "error": return "Failed";
     case "unsupported": return "Action not supported";
     default: return job.status;
@@ -44,8 +49,35 @@ function isCompilation(mode: Job["mode"]) {
 
 export function JobStatusCard({ jobId, onSettled }: JobStatusCardProps) {
   const [job, setJob] = useState<Job | null>(null);
+  const [slowHint, setSlowHint] = useState(false);
   const settled = useRef(false);
   const channelRef = useRef<ReturnType<ReturnType<typeof getBrowserClient>["channel"]> | null>(null);
+  const analyzingStartRef = useRef<number | null>(null);
+
+  // Track when we enter / leave the analyzing state.
+  useEffect(() => {
+    if (job?.status === "analyzing") {
+      if (!analyzingStartRef.current) analyzingStartRef.current = Date.now();
+    } else {
+      analyzingStartRef.current = null;
+      setSlowHint(false);
+    }
+  }, [job?.status]);
+
+  // Drive the slow-hint pulse independently of job updates.
+  useEffect(() => {
+    if (job?.status !== "analyzing") return;
+    const id = setInterval(() => {
+      const start = analyzingStartRef.current;
+      if (!start) return;
+      const elapsed = Date.now() - start;
+      if (elapsed >= SLOW_HINT_DELAY_MS) {
+        const cycle = (elapsed - SLOW_HINT_DELAY_MS) % SLOW_HINT_CYCLE_MS;
+        setSlowHint(cycle < SLOW_HINT_ON_MS);
+      }
+    }, 1_000);
+    return () => clearInterval(id);
+  }, [job?.status]);
 
   useEffect(() => {
     if (settled.current) return;
@@ -171,16 +203,46 @@ export function JobStatusCard({ jobId, onSettled }: JobStatusCardProps) {
           const isCurrent = step.status === job.status;
           const isPast = isDone || i < currentStepIndex;
           const isFuture = !isDone && i > currentStepIndex;
+          const color = isFuture ? "text-zinc-700" : isPast ? "text-green-500" : "text-zinc-300";
 
           let label = step.label;
           if (step.status === "extracting_clips" && job.clips_total != null) {
             label = `${step.label} (${job.clips_done}/${job.clips_total})`;
           }
+          if (step.status === "analyzing" && job.chunks_total != null) {
+            label = `${step.label} (${job.chunks_analyzed}/${job.chunks_total})`;
+          }
+
+          const showAnalysisExtras = step.status === "analyzing" && isCurrent;
+          const analyzePct =
+            job.chunks_total != null
+              ? Math.round((job.chunks_analyzed / job.chunks_total) * 100)
+              : 0;
 
           return (
-            <div key={step.status} className={`flex items-center gap-1.5 text-[11px] ${isFuture ? "text-zinc-700" : isPast ? "text-green-500" : "text-zinc-300"}`}>
-              <span>{isPast ? "✓" : isCurrent ? "●" : "○"}</span>
-              <span>{label}</span>
+            <div key={step.status} className="space-y-1">
+              <div className={`flex items-center gap-1.5 text-[11px] ${color}`}>
+                <span>{isPast ? "✓" : isCurrent ? "●" : "○"}</span>
+                <span>{label}</span>
+              </div>
+
+              {showAnalysisExtras && job.chunks_total != null && (
+                <div className="ml-3.5 h-0.5 w-24 overflow-hidden rounded-full bg-zinc-800">
+                  <div
+                    className="h-full rounded-full bg-blue-500 transition-all duration-700"
+                    style={{ width: `${analyzePct}%` }}
+                  />
+                </div>
+              )}
+
+              {showAnalysisExtras && (
+                <p
+                  className="ml-3.5 text-[10px] text-zinc-500 transition-opacity duration-700"
+                  style={{ opacity: slowHint ? 1 : 0 }}
+                >
+                  Still going — this is normal for long videos
+                </p>
+              )}
             </div>
           );
         })}

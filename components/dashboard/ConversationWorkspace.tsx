@@ -276,6 +276,8 @@ export function ConversationWorkspace({ conversationId }: { conversationId: stri
       include_audio: true,
       clips_total: null,
       clips_done: 0,
+      chunks_analyzed: 0,
+      chunks_total: null,
       compilation_r2_key: null,
       compilation_r2_url: null,
       error_message: null,

@@ -189,6 +189,16 @@ export async function extractTarget(prompt: string): Promise<PreStepResult> {
   }
 }
 
+function retryDelayMs(err: unknown): number | null {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (!msg.includes("RESOURCE_EXHAUSTED") && !msg.includes("429")) return null;
+  const match = msg.match(/"retryDelay":\s*"([\d.]+)s"/);
+  // Honour the server-specified delay + 2s buffer, or fall back to 60s.
+  return match ? Math.ceil(parseFloat(match[1])) * 1000 + 2_000 : 60_000;
+}
+
+const MAX_ANALYZE_RETRIES = 3;
+
 export async function analyzeChunk(
   geminiFileUri: string,
   job: Job,
@@ -201,35 +211,47 @@ export async function analyzeChunk(
       ? buildActionExtractionPrompt(job, chunkDurationSec)
       : buildCompilationPrompt(job, chunkDurationSec);
 
-  const response = await ai.models.generateContent({
-    model: "gemini-2.5-pro",
-    contents: [
-      {
-        role: "user",
-        parts: [
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= MAX_ANALYZE_RETRIES; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-pro",
+        contents: [
           {
-            fileData: { fileUri: geminiFileUri, mimeType: "video/mp4" },
-            videoMetadata: { fps: config.gemini.analysisFps },
+            role: "user",
+            parts: [
+              {
+                fileData: { fileUri: geminiFileUri, mimeType: "video/mp4" },
+                videoMetadata: { fps: config.gemini.analysisFps },
+              },
+              { text: systemPrompt },
+            ],
           },
-          { text: systemPrompt },
         ],
-      },
-    ],
-    config: { responseMimeType: "application/json" },
-  });
+        config: { responseMimeType: "application/json" },
+      });
 
-  const text = response.candidates?.[0]?.content?.parts?.[0]?.text ?? "[]";
-  try {
-    const parsed = JSON.parse(text);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (c) =>
-        typeof c.start_sec === "number" &&
-        typeof c.end_sec === "number" &&
-        c.end_sec > c.start_sec &&
-        (c.confidence ?? 1) >= 0.6,
-    );
-  } catch {
-    return [];
+      const text = response.candidates?.[0]?.content?.parts?.[0]?.text ?? "[]";
+      try {
+        const parsed = JSON.parse(text);
+        if (!Array.isArray(parsed)) return [];
+        return parsed.filter(
+          (c) =>
+            typeof c.start_sec === "number" &&
+            typeof c.end_sec === "number" &&
+            c.end_sec > c.start_sec &&
+            (c.confidence ?? 1) >= 0.6,
+        );
+      } catch {
+        return [];
+      }
+    } catch (err) {
+      lastErr = err;
+      const delay = retryDelayMs(err);
+      if (delay === null || attempt === MAX_ANALYZE_RETRIES) throw err;
+      console.warn(`[gemini] 429 on chunk — waiting ${delay}ms before retry ${attempt + 1}/${MAX_ANALYZE_RETRIES}`);
+      await sleep(delay);
+    }
   }
+  throw lastErr;
 }

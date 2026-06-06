@@ -6,7 +6,7 @@ function requireEnv(name: string): string {
   return val;
 }
 
-const slowdown = Number(process.env.GEMINI_VIDEO_SLOWDOWN ?? 2);
+const slowdown = Number(process.env.GEMINI_VIDEO_SLOWDOWN ?? 4);
 const analysisFps = Number(process.env.GEMINI_ANALYSIS_FPS ?? 3);
 const autoChunkSec = Math.floor(900_000 / (slowdown * analysisFps * 258));
 
@@ -28,7 +28,7 @@ export const config = {
     // 2.5 Pro on a ~900K-token chunk can take 5–8 min. 12 min gives breathing room.
     httpTimeoutMs: Math.max(10_000, Number(process.env.GEMINI_HTTP_TIMEOUT_MS ?? 720_000)),
     chunkDurationSec: Number(process.env.GEMINI_CHUNK_DURATION_SEC ?? autoChunkSec),
-    analysisParallelism: Number(process.env.GEMINI_ANALYSIS_PARALLELISM ?? 3),
+    analysisParallelism: Number(process.env.GEMINI_ANALYSIS_PARALLELISM ?? 2),
     videoSlowdownFactor: slowdown,
     analysisFps,
     minConfidence: Number(process.env.GEMINI_MIN_CONFIDENCE ?? 0.80),

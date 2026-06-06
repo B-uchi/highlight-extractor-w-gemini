@@ -229,17 +229,54 @@ export async function processJob(jobId: string): Promise<void> {
     const parallelism = config.gemini.analysisParallelism;
     const chunkResults: { clips: GeminiClipResult[]; chunkIndex: number; startSec: number }[] = [];
 
+    // Pre-seed from cache so retries skip chunks that already paid for.
+    // chunk_cache is keyed by string (JSON object keys are always strings).
+    const cachedResults = new Map<number, GeminiClipResult[]>(
+      Object.entries((job.chunk_cache ?? {}) as Record<string, GeminiClipResult[]>)
+        .map(([k, v]) => [Number(k), v]),
+    );
+
+    await setJobStatus(jobId, { chunks_total: chunks.length, chunks_analyzed: 0 });
+    let chunksAnalyzed = 0;
+
     for (let i = 0; i < chunks.length; i += parallelism) {
       const batch = chunks.slice(i, i + parallelism);
-      const batchResults = await Promise.all(
+      const batchResults = await Promise.allSettled(
         batch.map(async (chunk) => {
+          const cached = cachedResults.get(chunk.chunkIndex);
+          if (cached) return { clips: cached, chunkIndex: chunk.chunkIndex, startSec: chunk.startSec };
+
           const slowdown = config.gemini.videoSlowdownFactor;
           const chunkDurationSec = (chunk.endSec - chunk.startSec) * slowdown;
           const clips = await analyzeChunk(chunk.geminiFileId, job!, chunkDurationSec);
           return { clips, chunkIndex: chunk.chunkIndex, startSec: chunk.startSec };
         }),
       );
-      chunkResults.push(...batchResults);
+
+      let cacheUpdated = false;
+      for (const result of batchResults) {
+        chunksAnalyzed++;
+        if (result.status === "fulfilled") {
+          chunkResults.push(result.value);
+          if (!cachedResults.has(result.value.chunkIndex)) {
+            cachedResults.set(result.value.chunkIndex, result.value.clips);
+            cacheUpdated = true;
+          }
+        } else {
+          console.warn(
+            `[jobs] chunk failed (continuing): ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+          );
+        }
+      }
+
+      await setJobStatus(jobId, {
+        chunks_analyzed: chunksAnalyzed,
+        ...(cacheUpdated ? { chunk_cache: Object.fromEntries(cachedResults) } : {}),
+      });
+    }
+
+    if (chunkResults.length === 0) {
+      throw new Error("All video chunks failed to analyze.");
     }
 
     const mergedClips = mergeAndRank(

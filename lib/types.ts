@@ -75,6 +75,8 @@ export interface Job {
   include_audio: boolean;
   clips_total: number | null;
   clips_done: number;
+  chunks_analyzed: number;
+  chunks_total: number | null;
   compilation_r2_key: string | null;
   compilation_r2_url: string | null;
   error_message: string | null;
