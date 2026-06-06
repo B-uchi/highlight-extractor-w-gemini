@@ -22,15 +22,13 @@ function getBin(): string {
   throw new Error(`Cannot locate ffmpeg. Searched:\n${candidates.join("\n")}`);
 }
 
-function run(args: string[], timeoutMs = 30 * 60 * 1000): Promise<void> {
+function run(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(getBin(), args, { stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
-    const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error(`FFmpeg timed out`)); }, timeoutMs);
-    child.on("error", (err) => { clearTimeout(timer); reject(err); });
+    child.on("error", reject);
     child.on("close", (code) => {
-      clearTimeout(timer);
       if (code === 0) return resolve();
       reject(new Error(`FFmpeg exited ${code}: ${stderr.slice(-3000)}`));
     });
