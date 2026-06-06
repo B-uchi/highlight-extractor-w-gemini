@@ -65,7 +65,15 @@ export async function POST(
 
     if (!job) throw new Error("Failed to create job.");
 
-    await db.from("messages").update({ job_id: job.id }).eq("id", userMsg.id);
+    // Placeholder assistant message created now so JobStatusCard survives a page refresh.
+    // The worker updates its content (and only its content) when the job finishes.
+    await db.from("messages").insert({
+      conversation_id: id,
+      role: "assistant",
+      content: "",
+      job_id: job.id,
+    });
+
     await db.from("conversations").update({ updated_at: new Date().toISOString() }).eq("id", id);
 
     // Backend worker picks this up via Supabase Realtime on the jobs table.

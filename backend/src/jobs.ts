@@ -22,6 +22,14 @@ async function setJobStatus(jobId: string, patch: Partial<Job>): Promise<void> {
     .eq("id", jobId);
 }
 
+async function setJobMessage(jobId: string, content: string): Promise<void> {
+  await db
+    .from("messages")
+    .update({ content })
+    .eq("job_id", jobId)
+    .eq("role", "assistant");
+}
+
 async function getJob(jobId: string): Promise<Job | null> {
   const { data } = await db.from("jobs").select("*").eq("id", jobId).single();
   return data ?? null;
@@ -159,7 +167,6 @@ export async function processJob(jobId: string): Promise<void> {
   if (claimErr || !claimedJob) return;
 
   let job: Job | null = claimedJob as Job;
-  const conversationId = job.conversation_id;
   const tmpJobDir = path.join(TMP_ROOT, jobId);
   await mkdir(tmpJobDir, { recursive: true });
 
@@ -171,12 +178,7 @@ export async function processJob(jobId: string): Promise<void> {
     if (unfilledTokens.length > 0) {
       const unique = [...new Set(unfilledTokens)];
       await setJobStatus(jobId, { status: "unsupported" });
-      await db.from("messages").insert({
-        conversation_id: job.conversation_id,
-        role: "assistant",
-        content: `Please fill in the template fields before submitting: ${unique.join(", ")}`,
-        job_id: jobId,
-      });
+      await setJobMessage(jobId, `Please fill in the template fields before submitting: ${unique.join(", ")}`);
       return;
     }
 
@@ -184,12 +186,7 @@ export async function processJob(jobId: string): Promise<void> {
 
     if (!preStep.supported) {
       await setJobStatus(jobId, { status: "unsupported" });
-      await db.from("messages").insert({
-        conversation_id: job.conversation_id,
-        role: "assistant",
-        content: `Action not supported. I can only extract video clips — try asking for specific plays like dunks, blocks, assists, or player/team highlights.`,
-        job_id: jobId,
-      });
+      await setJobMessage(jobId, `Action not supported. I can only extract video clips — try asking for specific plays like dunks, blocks, assists, or player/team highlights.`);
       return;
     }
 
@@ -288,12 +285,7 @@ export async function processJob(jobId: string): Promise<void> {
 
     if (mergedClips.length === 0) {
       await setJobStatus(jobId, { status: "done", clips_total: 0 });
-      await db.from("messages").insert({
-        conversation_id: job.conversation_id,
-        role: "assistant",
-        content: `No clips found for: "${job.extracted_target}". Try a different action or check that the video contains this type of play.`,
-        job_id: jobId,
-      });
+      await setJobMessage(jobId, `No clips found for: "${job.extracted_target}". Try a different action or check that the video contains this type of play.`);
       return;
     }
 
@@ -398,13 +390,7 @@ export async function processJob(jobId: string): Promise<void> {
       ? `Highlight compiled — ${clipRows.length} play${clipRows.length !== 1 ? "s" : ""} for: ${job.extracted_target}`
       : `Found ${clipRows.length} clip${clipRows.length !== 1 ? "s" : ""} for: ${job.extracted_target}`;
 
-    await db.from("messages").insert({
-      conversation_id: job.conversation_id,
-      role: "assistant",
-      content: assistantContent,
-      job_id: jobId,
-    });
-
+    await setJobMessage(jobId, assistantContent);
     await setJobStatus(jobId, { status: "done" });
 
     console.log(`[jobs] ${jobId} done — ${clipRows.length} clip(s)`);
@@ -412,12 +398,7 @@ export async function processJob(jobId: string): Promise<void> {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[jobs] ${jobId} failed: ${message}`);
 
-    await db.from("messages").insert({
-      conversation_id: conversationId,
-      role: "assistant",
-      content: `Something went wrong: ${message}`,
-      job_id: jobId,
-    });
+    await setJobMessage(jobId, `Something went wrong: ${message}`);
     await setJobStatus(jobId, { status: "error", error_message: message });
   } finally {
     await rm(tmpJobDir, { recursive: true, force: true });

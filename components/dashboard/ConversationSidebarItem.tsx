@@ -1,8 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { Archive, ArchiveRestore, MoreHorizontal, Pencil } from "lucide-react";
+import { Archive, ArchiveRestore, MoreHorizontal, Pencil, Trash2 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
 
 import type { Conversation } from "@/lib/types";
 import { relativeTime } from "@/lib/format";
@@ -22,10 +23,12 @@ export function ConversationSidebarItem({
   onUpdated,
   onNavigate,
 }: Props) {
+  const router = useRouter();
   const [menuOpen, setMenuOpen] = useState(false);
   const [isRenaming, setIsRenaming] = useState(false);
   const [renameValue, setRenameValue] = useState(conversation.title);
   const [busy, setBusy] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const renameInputRef = useRef<HTMLInputElement>(null);
 
@@ -34,7 +37,7 @@ export function ConversationSidebarItem({
   }, [conversation.title]);
 
   useEffect(() => {
-    if (!menuOpen) return;
+    if (!menuOpen) { setConfirmDelete(false); return; }
     const handler = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setMenuOpen(false);
@@ -81,6 +84,24 @@ export function ConversationSidebarItem({
   const onArchiveToggle = async () => {
     setMenuOpen(false);
     await patch({ archived: !archived });
+  };
+
+  const onDelete = async () => {
+    if (!confirmDelete) {
+      setConfirmDelete(true);
+      return;
+    }
+    setMenuOpen(false);
+    setBusy(true);
+    try {
+      const res = await fetch(`/api/conversations/${conversation.id}`, { method: "DELETE" });
+      if (res.ok) {
+        onUpdated();
+        if (active) router.push("/dashboard");
+      }
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -133,7 +154,7 @@ export function ConversationSidebarItem({
             </button>
 
             {menuOpen && (
-              <div className="absolute right-0 z-10 mt-1 w-40 overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950 py-1 shadow-xl">
+              <div className="absolute right-0 z-10 mt-1 w-44 overflow-hidden rounded-lg border border-zinc-800 bg-zinc-950 py-1 shadow-xl">
                 <button
                   type="button"
                   className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-zinc-200 hover:bg-zinc-900"
@@ -152,6 +173,18 @@ export function ConversationSidebarItem({
                   ) : (
                     <><Archive className="h-3.5 w-3.5" />Archive</>
                   )}
+                </button>
+                <div className="my-1 border-t border-zinc-800" />
+                <button
+                  type="button"
+                  className={[
+                    "flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm hover:bg-zinc-900",
+                    confirmDelete ? "text-red-400 font-medium" : "text-zinc-400",
+                  ].join(" ")}
+                  onClick={() => void onDelete()}
+                >
+                  <Trash2 className="h-3.5 w-3.5 shrink-0" />
+                  {confirmDelete ? "Confirm delete?" : "Delete"}
                 </button>
               </div>
             )}
