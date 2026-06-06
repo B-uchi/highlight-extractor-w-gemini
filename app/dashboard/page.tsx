@@ -34,7 +34,7 @@ export default function DashboardHomePage() {
         </div>
         <p className="mt-3 text-sm leading-relaxed text-zinc-400">
           Start a conversation, upload a basketball game video, and ask for specific highlights —
-          dunks, blocks, player reels, team compilations, and more. Powered by Gemini.
+          dunks, blocks, player reels, team compilations, and more.
         </p>
 
         {error && (
