@@ -110,7 +110,6 @@ export async function cutClip(
     "-i", inputPath,
     "-ss", String(preBuf),
     "-t", String(duration),
-    "-threads", "2",
     "-c:v", "libx264", "-preset", "fast", "-crf", "22",
     "-c:a", "aac", "-b:a", "128k",
     "-movflags", "+faststart",

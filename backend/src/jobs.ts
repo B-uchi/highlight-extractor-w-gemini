@@ -10,7 +10,7 @@ import { config } from "./config";
 import type { GeminiClipResult, Job } from "./types";
 
 const TMP_ROOT = "/tmp/jobs";
-const MAX_CLIP_PARALLELISM = 1;
+const MAX_CLIP_PARALLELISM = 4;
 const BOUNDARY_DEDUP_SEC = 10;
 const PRE_ACTION_PAD = 2.5;
 const POST_ACTION_PAD = 2.5;
