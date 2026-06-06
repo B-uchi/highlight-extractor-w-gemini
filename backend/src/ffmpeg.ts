@@ -40,7 +40,7 @@ export async function preprocessVideo(inputPath: string, outputPath: string): Pr
   await run([
     "-y", "-i", inputPath,
     "-vf", "scale=-2:720",
-    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
     "-c:a", "aac", "-b:a", "128k",
     outputPath,
   ]);
@@ -87,7 +87,7 @@ export async function slowdownVideo(
   await run([
     "-y", "-i", inputPath,
     "-vf", `setpts=${factor}*PTS`,
-    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
     "-an",
     outputPath,
   ]);

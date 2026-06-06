@@ -39,6 +39,9 @@ export async function POST(
     return NextResponse.json({ error: "Missing upload key." }, { status: 400 });
   }
 
+  // Clear any error from a previous failed attempt before the frontend subscribes.
+  await db.from("conversations").update({ preprocessing_error: null }).eq("id", id);
+
   const { data: job, error } = await db
     .from("video_preprocessing_jobs")
     .insert({
