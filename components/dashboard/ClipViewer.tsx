@@ -346,10 +346,40 @@ function IndividualViewer({ clips }: { clips: Clip[] }) {
 // ── Compilation player ────────────────────────────────────────────────────────
 
 function CompilationViewer({ job, clips }: { job: Job; clips: Clip[] }) {
-  const [compilationUrl, setCompilationUrl] = useState(job.compilation_r2_url ?? null);
-  const [showClips, setShowClips] = useState(false);
+  const [compilationUrl, setCompilationUrl] = useState<string | null>(null);
+  const [urlLoading, setUrlLoading] = useState(true);
+  const [activeClipId, setActiveClipId] = useState<string | null>(null);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
 
-  async function download() {
+  // Refresh compilation URL on mount — presigned URLs expire after ~1 hour, so
+  // the URL stored in the DB may be stale when revisiting an old conversation.
+  useEffect(() => {
+    if (!job.compilation_r2_key) { setUrlLoading(false); return; }
+    void fetch(`/api/jobs/${job.id}`)
+      .then((r) => r.ok ? r.json() as Promise<{ job: Job }> : null)
+      .then((data: { job: Job } | null) => {
+        setCompilationUrl(data?.job.compilation_r2_url ?? job.compilation_r2_url ?? null);
+      })
+      .catch(() => { setCompilationUrl(job.compilation_r2_url ?? null); })
+      .finally(() => setUrlLoading(false));
+  }, [job.id, job.compilation_r2_key, job.compilation_r2_url]);
+
+  const showToast = (msg: string, durationMs = 2500) => {
+    setToast(msg);
+    setTimeout(() => setToast(null), durationMs);
+  };
+
+  function seekToClip(clip: Clip) {
+    setActiveClipId(clip.id);
+    if (videoRef.current && clip.highlight_start_sec != null) {
+      videoRef.current.currentTime = clip.highlight_start_sec;
+      void videoRef.current.play().catch(() => {});
+    }
+  }
+
+  async function downloadHighlight() {
     const res = await fetch(`/api/jobs/${job.id}`);
     if (!res.ok) return;
     const data = await res.json() as { job: Job };
@@ -362,12 +392,43 @@ function CompilationViewer({ job, clips }: { job: Job; clips: Clip[] }) {
     a.click();
   }
 
+  async function downloadClip(clip: Clip) {
+    if (downloadingId) return;
+    setDownloadingId(clip.id);
+    showToast("Preparing download...", 8000);
+    try {
+      const url = await fetchDownloadUrl(clip.id, "main");
+      if (!url) { showToast("Download failed."); return; }
+      window.location.href = url;
+      showToast("Download started.");
+    } catch {
+      showToast("Download failed.");
+    } finally {
+      setDownloadingId(null);
+    }
+  }
+
   return (
     <div className="flex h-full flex-col">
-      {/* Compilation player */}
-      <div className="shrink-0 bg-black">
-        {compilationUrl ? (
-          <video src={compilationUrl} controls autoPlay className="w-full aspect-video" />
+      {/* Video player */}
+      <div className="relative shrink-0 bg-black">
+        {toast && (
+          <div className="absolute bottom-3 left-1/2 z-20 -translate-x-1/2 rounded-full bg-zinc-800/90 px-3 py-1.5 text-xs text-zinc-200 shadow-lg backdrop-blur-sm ring-1 ring-zinc-700/60 pointer-events-none">
+            {toast}
+          </div>
+        )}
+        {urlLoading ? (
+          <div className="flex aspect-video items-center justify-center">
+            <div className="h-6 w-6 animate-spin rounded-full border-2 border-zinc-700 border-t-blue-400" />
+          </div>
+        ) : compilationUrl ? (
+          <video
+            ref={videoRef}
+            src={compilationUrl}
+            controls
+            autoPlay
+            className="w-full aspect-video"
+          />
         ) : (
           <div className="flex aspect-video items-center justify-center text-xs text-zinc-600">
             No video available
@@ -375,7 +436,7 @@ function CompilationViewer({ job, clips }: { job: Job; clips: Clip[] }) {
         )}
       </div>
 
-      {/* Meta + download */}
+      {/* Meta + download full reel */}
       <div className="shrink-0 border-b border-zinc-800/60 px-4 py-3 space-y-2">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
@@ -384,16 +445,16 @@ function CompilationViewer({ job, clips }: { job: Job; clips: Clip[] }) {
           </div>
           <button
             type="button"
-            onClick={() => void download()}
+            onClick={() => void downloadHighlight()}
             className="shrink-0 flex items-center gap-1.5 rounded-lg bg-zinc-800 px-3 py-1.5 text-xs text-zinc-300 hover:bg-zinc-700 transition-colors"
           >
             <Download className="h-3.5 w-3.5" />
-            Download
+            Full reel
           </button>
         </div>
         <div className="flex items-center gap-1.5">
           <span className="rounded-full bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400">
-            {clips.length} plays
+            {clips.length} play{clips.length !== 1 ? "s" : ""}
           </span>
           {!job.include_audio && (
             <span className="rounded-full bg-zinc-800 px-2 py-0.5 text-[10px] text-zinc-400">
@@ -403,37 +464,59 @@ function CompilationViewer({ job, clips }: { job: Job; clips: Clip[] }) {
         </div>
       </div>
 
-      {/* Source clips toggle */}
+      {/* Per-play list: seek + individual download */}
       {clips.length > 0 && (
         <div className="min-h-0 flex-1 overflow-y-auto">
-          <button
-            type="button"
-            onClick={() => setShowClips((s) => !s)}
-            className="flex w-full items-center gap-2 px-4 py-3 text-left hover:bg-zinc-900/40 transition-colors"
-          >
-            <Film className="h-3.5 w-3.5 text-zinc-600" />
-            <span className="text-xs font-medium text-zinc-500">
-              {showClips ? "Hide" : "Show"} source clips ({clips.length})
-            </span>
-          </button>
-
-          {showClips && (
-            <ul className="px-3 pb-3 space-y-1">
-              {clips.map((c) => (
-                <li key={c.id} className="rounded-lg bg-zinc-900 px-3 py-2 ring-1 ring-zinc-800">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="truncate text-xs font-medium text-zinc-300">{c.title}</p>
-                    <span className="shrink-0 text-[10px] text-zinc-600">
-                      {formatDuration(c.start_sec)} → {formatDuration(c.end_sec)}
-                    </span>
+          <p className="px-4 pt-3 pb-1.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-600">
+            Plays · click to seek
+          </p>
+          <ul className="px-3 pb-3 space-y-1.5">
+            {clips.map((c) => {
+              const isActive = c.id === activeClipId;
+              const dur = formatDuration((c.follow_up_end_sec ?? c.end_sec) - c.start_sec);
+              return (
+                <li key={c.id}>
+                  <div className={`flex items-center gap-2 rounded-lg px-3 py-2.5 ring-1 transition-colors ${
+                    isActive
+                      ? "bg-blue-500/10 ring-blue-500/30"
+                      : "bg-zinc-900/50 ring-zinc-800/60 hover:ring-zinc-700/80"
+                  }`}>
+                    {/* Click to seek */}
+                    <button
+                      type="button"
+                      onClick={() => seekToClip(c)}
+                      className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                    >
+                      <span className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-full text-[10px] font-bold ${
+                        isActive ? "bg-blue-500 text-white" : "bg-zinc-800 text-zinc-400"
+                      }`}>
+                        {c.rank}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <p className={`truncate text-xs font-medium ${isActive ? "text-zinc-100" : "text-zinc-300"}`}>
+                          {c.title}
+                        </p>
+                        {c.description && (
+                          <p className="truncate text-[10px] text-zinc-600">{c.description}</p>
+                        )}
+                      </div>
+                      <span className="shrink-0 text-[10px] text-zinc-600">{dur}</span>
+                    </button>
+                    {/* Download this clip */}
+                    <button
+                      type="button"
+                      onClick={() => void downloadClip(c)}
+                      disabled={!!downloadingId}
+                      title="Download this clip"
+                      className="shrink-0 rounded-md p-1.5 text-zinc-600 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-40 transition-colors"
+                    >
+                      <Download className={`h-3 w-3 ${downloadingId === c.id ? "animate-pulse" : ""}`} />
+                    </button>
                   </div>
-                  {c.description && (
-                    <p className="mt-0.5 text-[10px] text-zinc-600 line-clamp-1">{c.description}</p>
-                  )}
                 </li>
-              ))}
-            </ul>
-          )}
+              );
+            })}
+          </ul>
         </div>
       )}
     </div>

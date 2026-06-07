@@ -112,6 +112,7 @@ export interface Clip {
   r2_clip_url: string | null;
   r2_follow_up_clip_key: string | null;
   r2_follow_up_clip_url: string | null;
+  highlight_start_sec: number | null;
   created_at: string;
 }
 

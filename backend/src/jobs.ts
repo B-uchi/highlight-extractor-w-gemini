@@ -112,6 +112,7 @@ async function extractAndUploadClip(
   sourcePath: string,
   followUpSecs: number | null,
   clipIndex: number,
+  isHighlightMode: boolean,
 ): Promise<{
   id: string;
   r2_clip_key: string;
@@ -124,19 +125,16 @@ async function extractAndUploadClip(
 }> {
   const clipId = randomUUID();
   const tmpOutMain = path.join(TMP_ROOT, jobId, `clip_${clipIndex}.mp4`);
-  const tmpOutFollowUp = followUpSecs
-    ? path.join(TMP_ROOT, jobId, `clip_${clipIndex}_followup.mp4`)
-    : null;
 
   const cutStart = Math.max(0, clip.start_sec - PRE_ACTION_PAD);
   const naturalEnd = clip.end_sec + POST_ACTION_PAD;
   const followUpEndSec = followUpSecs ? naturalEnd + followUpSecs : null;
 
-  await cutClip(sourcePath, cutStart, naturalEnd, tmpOutMain);
+  // Highlight mode: merge follow-up into the main clip so there's one file per play.
+  // Individual mode: action clip ends at naturalEnd; follow-up is a separate file.
+  const clipEnd = isHighlightMode && followUpEndSec ? followUpEndSec : naturalEnd;
 
-  if (followUpSecs && tmpOutFollowUp && followUpEndSec) {
-    await cutClip(sourcePath, naturalEnd, followUpEndSec, tmpOutFollowUp);
-  }
+  await cutClip(sourcePath, cutStart, clipEnd, tmpOutMain);
 
   const r2Key = `clips/${conversationId}/${jobId}/${clip.rank}-${clipId}.mp4`;
   await uploadFileToR2(tmpOutMain, r2Key);
@@ -146,7 +144,9 @@ async function extractAndUploadClip(
   let r2FollowUpKey: string | null = null;
   let r2FollowUpUrl: string | null = null;
 
-  if (followUpSecs && tmpOutFollowUp) {
+  if (!isHighlightMode && followUpSecs && followUpEndSec) {
+    const tmpOutFollowUp = path.join(TMP_ROOT, jobId, `clip_${clipIndex}_followup.mp4`);
+    await cutClip(sourcePath, naturalEnd, followUpEndSec, tmpOutFollowUp);
     r2FollowUpKey = `clips/${conversationId}/${jobId}/${clip.rank}-${clipId}-followup.mp4`;
     await uploadFileToR2(tmpOutFollowUp, r2FollowUpKey);
     await safeUnlink(tmpOutFollowUp);
@@ -160,8 +160,9 @@ async function extractAndUploadClip(
     r2_follow_up_clip_key: r2FollowUpKey,
     r2_follow_up_clip_url: r2FollowUpUrl,
     start_sec: cutStart,
-    end_sec: naturalEnd,
-    follow_up_end_sec: followUpEndSec,
+    // Highlight mode with follow-up: end_sec absorbs the follow-up (no separate file).
+    end_sec: clipEnd,
+    follow_up_end_sec: isHighlightMode ? null : followUpEndSec,
   };
 }
 
@@ -439,6 +440,7 @@ export async function processJob(jobId: string): Promise<void> {
       r2_clip_url: string;
       r2_follow_up_clip_key: string | null;
       r2_follow_up_clip_url: string | null;
+      highlight_start_sec: number | null;
     }[] = [];
 
     for (let i = 0; i < mergedClips.length; i += MAX_CLIP_PARALLELISM) {
@@ -453,6 +455,7 @@ export async function processJob(jobId: string): Promise<void> {
             sourcePath,
             job!.follow_up_secs,
             idx,
+            mode !== "action_extraction",
           );
           clipRows.push({
             id: uploaded.id,
@@ -470,6 +473,7 @@ export async function processJob(jobId: string): Promise<void> {
             r2_clip_url: uploaded.r2_clip_url,
             r2_follow_up_clip_key: uploaded.r2_follow_up_clip_key,
             r2_follow_up_clip_url: uploaded.r2_follow_up_clip_url,
+            highlight_start_sec: null, // calculated below, before insert
           });
           await setJobStatus(jobId, { clips_done: clipRows.length });
         }),
@@ -477,6 +481,16 @@ export async function processJob(jobId: string): Promise<void> {
     }
 
     clipRows.sort((a, b) => a.rank - b.rank);
+
+    // Pre-calculate each clip's start offset in the stitched highlight reel.
+    if (mode !== "action_extraction") {
+      let offset = 0;
+      for (const row of clipRows) {
+        row.highlight_start_sec = offset;
+        offset += (row.follow_up_end_sec ?? row.end_sec) - row.start_sec;
+      }
+    }
+
     await db.from("clips").insert(clipRows);
 
     // ── Step 7: Stitch (compilation only) ────────────────────────────────────
