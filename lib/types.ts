@@ -57,7 +57,16 @@ export type JobStatus =
   | "stitching"
   | "done"
   | "error"
-  | "unsupported";
+  | "unsupported"
+  | "cancelling"
+  | "cancelled";
+
+export interface FailedChunk {
+  chunkIndex: number;
+  startSec: number;
+  endSec: number;
+  error: string;
+}
 
 export interface Job {
   id: string;
@@ -77,6 +86,7 @@ export interface Job {
   clips_done: number;
   chunks_analyzed: number;
   chunks_total: number | null;
+  failed_chunks: FailedChunk[] | null;
   compilation_r2_key: string | null;
   compilation_r2_url: string | null;
   error_message: string | null;

@@ -9,6 +9,22 @@ import { PromptInput } from "@/components/dashboard/PromptInput";
 import type { Clip, Conversation, Job, MessageWithClips } from "@/lib/types";
 import { relativeTime } from "@/lib/format";
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function formatFailedChunkRange(chunks: { startSec: number; endSec: number }[]): string {
+  const toHMS = (s: number) => {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60);
+    return h > 0
+      ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`
+      : `${m}:${String(sec).padStart(2, "0")}`;
+  };
+  const earliest = Math.min(...chunks.map((c) => c.startSec));
+  const latest = Math.max(...chunks.map((c) => c.endSec));
+  return `${toHMS(earliest)}–${toHMS(latest)}`;
+}
+
 // ── Message rendering ─────────────────────────────────────────────────────────
 
 function UserBubble({ content, time }: { content: string; time: string }) {
@@ -96,12 +112,19 @@ function MessageRow({
   message,
   onJobSettled,
   onOpenClips,
+  onJobRetried,
 }: {
   message: MessageWithClips;
   onJobSettled: (jobId: string, job: Job, clips: Clip[]) => void;
   onOpenClips: (job: Job, clips: Clip[]) => void;
+  onJobRetried: () => void;
 }) {
   const time = relativeTime(message.created_at);
+
+  const handleRetry = async (jobId: string) => {
+    await fetch(`/api/jobs/${jobId}/retry`, { method: "POST" });
+    onJobRetried();
+  };
 
   if (message.role === "user") {
     return <UserBubble content={message.content} time={time} />;
@@ -123,8 +146,38 @@ function MessageRow({
       );
     }
 
+    // Error or cancelled: show message + retry button
+    if (job.status === "error" || job.status === "cancelled") {
+      const failedChunks = job.failed_chunks ?? [];
+      return (
+        <div className="flex justify-start">
+          <div className="max-w-[70%] space-y-1">
+            <div className="rounded-2xl rounded-bl-sm bg-zinc-900 px-4 py-3 ring-1 ring-zinc-800">
+              <p className="text-sm text-zinc-300 whitespace-pre-wrap">
+                {message.content || (job.status === "cancelled" ? "Job was cancelled." : "Something went wrong.")}
+              </p>
+              {failedChunks.length > 0 && (
+                <p className="mt-1.5 text-[11px] text-amber-500/80">
+                  ⚠ {failedChunks.length} chunk{failedChunks.length !== 1 ? "s" : ""} skipped
+                  {" "}({formatFailedChunkRange(failedChunks)} of original footage)
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={() => void handleRetry(message.job_id!)}
+                className="mt-2 text-[11px] text-blue-400 hover:text-blue-300 transition-colors"
+              >
+                Retry →
+              </button>
+            </div>
+            <p className="text-[10px] text-zinc-600">{relativeTime(message.created_at)}</p>
+          </div>
+        </div>
+      );
+    }
+
     // Job is running or just finished with no clips
-    if (!["done", "error", "unsupported"].includes(job.status)) {
+    if (!["done", "error", "unsupported", "cancelled"].includes(job.status)) {
       return (
         <div className="flex justify-start">
           <div className="w-full max-w-[70%]">
@@ -213,7 +266,7 @@ export function ConversationWorkspace({ conversationId }: { conversationId: stri
 
       // Check if any message has a running job
       const running = json.messages.some(
-        (m) => m.job && !["done", "error", "unsupported"].includes(m.job.status),
+        (m) => m.job && !["done", "error", "unsupported", "cancelled"].includes(m.job.status),
       );
       setActiveJob(running);
     } catch {
@@ -278,6 +331,7 @@ export function ConversationWorkspace({ conversationId }: { conversationId: stri
       clips_done: 0,
       chunks_analyzed: 0,
       chunks_total: null,
+      failed_chunks: null,
       compilation_r2_key: null,
       compilation_r2_url: null,
       error_message: null,
@@ -401,6 +455,7 @@ export function ConversationWorkspace({ conversationId }: { conversationId: stri
                   message={msg}
                   onJobSettled={handleJobSettled}
                   onOpenClips={(job, clips) => setViewer({ job, clips })}
+                  onJobRetried={() => void load()}
                 />
               ))}
               <div ref={bottomRef} />

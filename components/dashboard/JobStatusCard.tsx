@@ -16,7 +16,7 @@ interface JobStatusCardProps {
   onSettled: (job: Job, clips: Clip[]) => void;
 }
 
-const TERMINAL: Job["status"][] = ["done", "error", "unsupported"];
+const TERMINAL: Job["status"][] = ["done", "error", "unsupported", "cancelled"];
 
 function statusLabel(job: Job): string {
   switch (job.status) {
@@ -29,6 +29,8 @@ function statusLabel(job: Job): string {
     case "extracting_clips":
       return `Cutting clips (${job.clips_done}/${job.clips_total ?? "?"})...`;
     case "stitching": return "Stitching highlight reel...";
+    case "cancelling": return "Cancelling...";
+    case "cancelled": return "Cancelled";
     case "done": return "Done";
     case "error": return "Failed";
     case "unsupported": return "Action not supported";
@@ -50,6 +52,7 @@ function isCompilation(mode: Job["mode"]) {
 export function JobStatusCard({ jobId, onSettled }: JobStatusCardProps) {
   const [job, setJob] = useState<Job | null>(null);
   const [slowHint, setSlowHint] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const settled = useRef(false);
   const channelRef = useRef<ReturnType<ReturnType<typeof getBrowserClient>["channel"]> | null>(null);
   const analyzingStartRef = useRef<number | null>(null);
@@ -141,6 +144,20 @@ export function JobStatusCard({ jobId, onSettled }: JobStatusCardProps) {
     };
   }, [jobId, onSettled]);
 
+  const handleCancel = async () => {
+    setCancelling(true);
+    try {
+      await fetch(`/api/jobs/${jobId}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ action: "cancel" }),
+      });
+      // Realtime will pick up status → cancelling → cancelled
+    } finally {
+      setCancelling(false);
+    }
+  };
+
   if (!job) {
     return (
       <div className="flex items-center gap-2 text-xs text-zinc-500">
@@ -171,6 +188,15 @@ export function JobStatusCard({ jobId, onSettled }: JobStatusCardProps) {
             <p className="mt-0.5 text-xs text-zinc-500">{job.error_message}</p>
           )}
         </div>
+      </div>
+    );
+  }
+
+  if (job.status === "cancelled" || job.status === "cancelling") {
+    return (
+      <div className="flex items-start gap-2 rounded-xl bg-zinc-900/60 px-3 py-2.5 ring-1 ring-zinc-800">
+        <Ban className="mt-0.5 h-4 w-4 shrink-0 text-zinc-500" />
+        <p className="text-xs text-zinc-400">Job was cancelled.</p>
       </div>
     );
   }
@@ -235,6 +261,12 @@ export function JobStatusCard({ jobId, onSettled }: JobStatusCardProps) {
                 </div>
               )}
 
+              {showAnalysisExtras && job.chunks_total != null && (
+                <p className="ml-3.5 text-[10px] text-zinc-600">
+                  ~{job.chunks_total * 6} min est. · {job.chunks_total} chunk{job.chunks_total !== 1 ? "s" : ""}
+                </p>
+              )}
+
               {showAnalysisExtras && (
                 <p
                   className="ml-3.5 text-[10px] text-zinc-500 transition-opacity duration-700"
@@ -247,6 +279,19 @@ export function JobStatusCard({ jobId, onSettled }: JobStatusCardProps) {
           );
         })}
       </div>
+
+      {["pending", "extracting_target", "analyzing"].includes(job.status) && (
+        <div className="flex justify-end pt-1">
+          <button
+            type="button"
+            disabled={cancelling}
+            onClick={() => void handleCancel()}
+            className="text-[10px] text-zinc-600 hover:text-red-400 disabled:opacity-40 transition-colors"
+          >
+            {cancelling ? "Cancelling..." : "Cancel"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

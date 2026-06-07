@@ -6,7 +6,7 @@ function requireEnv(name: string): string {
   return val;
 }
 
-const slowdown = Number(process.env.GEMINI_VIDEO_SLOWDOWN ?? 4);
+const slowdown = Number(process.env.GEMINI_VIDEO_SLOWDOWN ?? 2);
 const analysisFps = Number(process.env.GEMINI_ANALYSIS_FPS ?? 3);
 const autoChunkSec = Math.floor(900_000 / (slowdown * analysisFps * 258));
 

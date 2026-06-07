@@ -9,6 +9,22 @@ import { config } from "./config";
 
 const PREPROCESSING_TMP = "/tmp/preprocessing";
 
+// ── Analysis job slot guard ───────────────────────────────────────────────────
+
+const activeAnalysisJobIds = new Set<string>();
+
+function startAnalysisJob(jobId: string): void {
+  if (activeAnalysisJobIds.size > 0) {
+    console.log(`[worker] job ${jobId} queued — analysis slot occupied by ${[...activeAnalysisJobIds][0]}`);
+    return; // poll fallback will pick it up when the current job finishes
+  }
+  activeAnalysisJobIds.add(jobId);
+  void processJob(jobId).finally(() => {
+    activeAnalysisJobIds.delete(jobId);
+    void drainAnalysisJobs(); // kick next pending job immediately
+  });
+}
+
 // ── Preprocessing job processor ───────────────────────────────────────────────
 
 async function processPreprocessingJob(jobId: string): Promise<void> {
@@ -149,7 +165,7 @@ async function drainAnalysisJobs(): Promise<void> {
       .update({ status: "pending", updated_at: new Date().toISOString() })
       .eq("id", j.id)
       .neq("status", "pending");
-    void processJob(j.id);
+    startAnalysisJob(j.id);
   }
 }
 
@@ -184,7 +200,7 @@ function subscribeToJobQueue(): void {
         const row = payload.new as { id: string; status: string };
         if (row.status === "pending") {
           console.log(`[worker] realtime: analysis job ${row.id}`);
-          void processJob(row.id);
+          startAnalysisJob(row.id);
         }
       },
     )
@@ -209,7 +225,7 @@ function startPollFallbacks(): void {
       .select("id")
       .eq("status", "pending")
       .limit(3);
-    for (const j of analysisJobs ?? []) void processJob(j.id);
+    for (const j of analysisJobs ?? []) startAnalysisJob(j.id);
   }, config.pollIntervalMs);
 }
 

@@ -5,15 +5,17 @@ import { randomUUID } from "node:crypto";
 import { db } from "./db";
 import { downloadFromR2, uploadFileToR2, getPresignedUrl, safeUnlink } from "./storage";
 import { cutClip, stitchClips } from "./ffmpeg";
-import { analyzeChunk, ensureChunksReady, extractTarget } from "./gemini";
+import { analyzeChunk, ensureChunksReady, extractTarget, retryDelayMs, estimateChunkTokens, isBillingQuotaError, isStorageQuotaError } from "./gemini";
 import { config } from "./config";
-import type { GeminiClipResult, Job } from "./types";
+import type { FailedChunk, GeminiClipResult, Job } from "./types";
 
 const TMP_ROOT = "/tmp/jobs";
 const MAX_CLIP_PARALLELISM = 4;
 const BOUNDARY_DEDUP_SEC = 10;
 const PRE_ACTION_PAD = 2.5;
 const POST_ACTION_PAD = 2.5;
+
+const GEMINI_MAX_INPUT_TOKENS = 1_048_576; // Gemini 2.5 Pro context limit
 
 async function setJobStatus(jobId: string, patch: Partial<Job>): Promise<void> {
   await db
@@ -33,6 +35,15 @@ async function setJobMessage(jobId: string, content: string): Promise<void> {
 async function getJob(jobId: string): Promise<Job | null> {
   const { data } = await db.from("jobs").select("*").eq("id", jobId).single();
   return data ?? null;
+}
+
+async function checkCancelled(jobId: string): Promise<boolean> {
+  const { data } = await db.from("jobs").select("status").eq("id", jobId).single();
+  return data?.status === "cancelling";
+}
+
+async function sleep(ms: number) {
+  return new Promise<void>((r) => setTimeout(r, ms));
 }
 
 function offsetClips(
@@ -154,6 +165,18 @@ async function extractAndUploadClip(
   };
 }
 
+function formatTimeRange(chunks: FailedChunk[]): string {
+  const toHMS = (s: number) => {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60);
+    return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}` : `${m}:${String(sec).padStart(2, "0")}`;
+  };
+  const earliest = Math.min(...chunks.map((c) => c.startSec));
+  const latest = Math.max(...chunks.map((c) => c.endSec));
+  return `${toHMS(earliest)}–${toHMS(latest)}`;
+}
+
 export async function processJob(jobId: string): Promise<void> {
   // Atomic claim: only proceed if job is still pending.
   const { data: claimedJob, error: claimErr } = await db
@@ -169,6 +192,7 @@ export async function processJob(jobId: string): Promise<void> {
   let job: Job | null = claimedJob as Job;
   const tmpJobDir = path.join(TMP_ROOT, jobId);
   await mkdir(tmpJobDir, { recursive: true });
+  let billingErrorMsg: string | null = null;
 
   try {
     // ── Step 1: Validate + extract target ────────────────────────────────────
@@ -215,6 +239,16 @@ export async function processJob(jobId: string): Promise<void> {
       throw new Error("Conversation has no video uploaded.");
     }
 
+    // Pre-flight: verify a single chunk won't exceed Gemini's per-request token limit.
+    const tokensPerChunk = estimateChunkTokens(config.gemini.chunkDurationSec);
+    if (tokensPerChunk > GEMINI_MAX_INPUT_TOKENS) {
+      throw new Error(
+        `Video chunk would exceed Gemini's ${(GEMINI_MAX_INPUT_TOKENS / 1000).toFixed(0)}K token limit ` +
+        `(estimated ${Math.round(tokensPerChunk / 1000)}K). ` +
+        `Reduce GEMINI_CHUNK_DURATION_SEC, GEMINI_VIDEO_SLOWDOWN, or GEMINI_ANALYSIS_FPS.`,
+      );
+    }
+
     // ── Step 3: Ensure Gemini chunks are ready ───────────────────────────────
     const chunks = await ensureChunksReady(
       job.conversation_id,
@@ -222,58 +256,147 @@ export async function processJob(jobId: string): Promise<void> {
       conv.video_duration_secs,
     );
 
-    // ── Step 4: Analyze all chunks (parallel, capped) ────────────────────────
-    const parallelism = config.gemini.analysisParallelism;
-    const chunkResults: { clips: GeminiClipResult[]; chunkIndex: number; startSec: number }[] = [];
+    // Cancellation check before analysis
+    if (await checkCancelled(jobId)) {
+      await setJobMessage(jobId, "Job was cancelled before analysis started.");
+      await setJobStatus(jobId, { status: "cancelled" });
+      return;
+    }
 
-    // Pre-seed from cache so retries skip chunks that already paid for.
-    // chunk_cache is keyed by string (JSON object keys are always strings).
+    // ── Step 4: Analyze all chunks (coordinated, with 429 backoff + cancel support) ─
+    const slowdown = config.gemini.videoSlowdownFactor;
+
+    // Pre-seed from chunk_cache (previous run's successful results).
     const cachedResults = new Map<number, GeminiClipResult[]>(
       Object.entries((job.chunk_cache ?? {}) as Record<string, GeminiClipResult[]>)
         .map(([k, v]) => [Number(k), v]),
     );
 
-    await setJobStatus(jobId, { chunks_total: chunks.length, chunks_analyzed: 0 });
-    let chunksAnalyzed = 0;
+    // Pre-load cached chunks into results so they appear in the final merge.
+    const chunkResults: { clips: GeminiClipResult[]; chunkIndex: number; startSec: number }[] = [];
+    for (const chunk of chunks) {
+      const cached = cachedResults.get(chunk.chunkIndex);
+      if (cached) chunkResults.push({ clips: cached, chunkIndex: chunk.chunkIndex, startSec: chunk.startSec });
+    }
 
-    for (let i = 0; i < chunks.length; i += parallelism) {
-      const batch = chunks.slice(i, i + parallelism);
+    const failedChunks: FailedChunk[] = [];
+    let chunksAnalyzed = cachedResults.size;
+    let currentParallelism = config.gemini.analysisParallelism;
+
+    // Queue: only chunks not already cached.
+    const pending = chunks.filter((c) => !cachedResults.has(c.chunkIndex));
+
+    await setJobStatus(jobId, { chunks_total: chunks.length, chunks_analyzed: chunksAnalyzed });
+
+    while (pending.length > 0) {
+      if (await checkCancelled(jobId)) break;
+
+      const batch = pending.splice(0, currentParallelism);
+      const batchController = new AbortController();
+      let retryDelay: number | null = null;
+
       const batchResults = await Promise.allSettled(
         batch.map(async (chunk) => {
-          const cached = cachedResults.get(chunk.chunkIndex);
-          if (cached) return { clips: cached, chunkIndex: chunk.chunkIndex, startSec: chunk.startSec };
-
-          const slowdown = config.gemini.videoSlowdownFactor;
+          if (batchController.signal.aborted) throw Object.assign(new Error("batch-abort"), { batchAbort: true });
           const chunkDurationSec = (chunk.endSec - chunk.startSec) * slowdown;
-          const clips = await analyzeChunk(chunk.geminiFileId, job!, chunkDurationSec);
-          return { clips, chunkIndex: chunk.chunkIndex, startSec: chunk.startSec };
+          try {
+            const clips = await analyzeChunk(chunk.geminiFileId, job!, chunkDurationSec, batchController.signal);
+            return { clips, chunkIndex: chunk.chunkIndex, startSec: chunk.startSec };
+          } catch (err) {
+            // On first 429 in a batch: record delay + abort siblings.
+            const delay = retryDelayMs(err);
+            if (delay !== null && retryDelay === null) {
+              retryDelay = delay;
+              batchController.abort();
+            } else if (isBillingQuotaError(err) && !batchController.signal.aborted) {
+              batchController.abort(); // Cancel sibling requests — billing errors are not retryable
+            }
+            throw err;
+          }
         }),
       );
 
-      let cacheUpdated = false;
-      for (const result of batchResults) {
-        chunksAnalyzed++;
+      // triage results
+      const toRetry: typeof batch = [];
+      for (let bi = 0; bi < batchResults.length; bi++) {
+        const result = batchResults[bi];
+        const chunk = batch[bi];
+
         if (result.status === "fulfilled") {
           chunkResults.push(result.value);
-          if (!cachedResults.has(result.value.chunkIndex)) {
-            cachedResults.set(result.value.chunkIndex, result.value.clips);
-            cacheUpdated = true;
+          if (!cachedResults.has(chunk.chunkIndex)) {
+            cachedResults.set(chunk.chunkIndex, result.value.clips);
           }
+          chunksAnalyzed++;
         } else {
-          console.warn(
-            `[jobs] chunk failed (continuing): ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
-          );
+          const err = result.reason as Error & { batchAbort?: boolean };
+          const isBatchAbort = err?.batchAbort === true;
+          const is429 = retryDelayMs(err) !== null;
+
+          if (isBatchAbort || is429) {
+            toRetry.push(chunk); // put back for retry
+          } else if ((err as NodeJS.ErrnoException)?.name === "AbortError") {
+            // User-initiated cancel signal — don't record as failure
+            toRetry.push(chunk);
+          } else {
+            const isBilling = isBillingQuotaError(err);
+            failedChunks.push({
+              chunkIndex: chunk.chunkIndex,
+              startSec: chunk.startSec,
+              endSec: chunk.endSec,
+              error: isBilling ? "Billing quota exhausted" : (err?.message ?? String(err)),
+            });
+            chunksAnalyzed++;
+            console.warn(`[jobs] chunk ${chunk.chunkIndex} permanently failed: ${err?.message}`);
+            if (isBilling && billingErrorMsg === null) {
+              billingErrorMsg = "Your Gemini API quota has been exhausted. Please check your billing details or wait for the quota to reset.";
+            }
+          }
         }
+      }
+
+      if (billingErrorMsg !== null) {
+        // Hard billing limit — mark all remaining work as failed and stop processing.
+        const billingNote = "Billing quota exhausted — not attempted";
+        for (const c of toRetry) {
+          failedChunks.push({ chunkIndex: c.chunkIndex, startSec: c.startSec, endSec: c.endSec, error: billingNote });
+          chunksAnalyzed++;
+        }
+        for (const c of pending) {
+          failedChunks.push({ chunkIndex: c.chunkIndex, startSec: c.startSec, endSec: c.endSec, error: billingNote });
+          chunksAnalyzed++;
+        }
+        pending.length = 0;
+      } else {
+        // Put retry chunks back at front.
+        pending.unshift(...toRetry);
+      }
+
+      if (retryDelay !== null) {
+        currentParallelism = 1; // drop parallelism after 429
+        console.warn(`[jobs] 429 — waiting ${retryDelay}ms, retrying with parallelism=1`);
+        await sleep(retryDelay);
       }
 
       await setJobStatus(jobId, {
         chunks_analyzed: chunksAnalyzed,
-        ...(cacheUpdated ? { chunk_cache: Object.fromEntries(cachedResults) } : {}),
+        chunk_cache: Object.fromEntries(cachedResults),
+        ...(failedChunks.length > 0 ? { failed_chunks: failedChunks } : {}),
       });
     }
 
+    // Cancellation mid-analysis
+    if (await checkCancelled(jobId)) {
+      const note = chunkResults.length > 0
+        ? `Job cancelled — partial results from ${chunkResults.length}/${chunks.length} chunk(s) discarded.`
+        : "Job was cancelled during analysis.";
+      await setJobMessage(jobId, note);
+      await setJobStatus(jobId, { status: "cancelled" });
+      return;
+    }
+
     if (chunkResults.length === 0) {
-      throw new Error("All video chunks failed to analyze.");
+      throw new Error(billingErrorMsg ?? "All video chunks failed to analyze.");
     }
 
     const mergedClips = mergeAndRank(
@@ -390,16 +513,32 @@ export async function processJob(jobId: string): Promise<void> {
       ? `Highlight compiled — ${clipRows.length} play${clipRows.length !== 1 ? "s" : ""} for: ${job.extracted_target}`
       : `Found ${clipRows.length} clip${clipRows.length !== 1 ? "s" : ""} for: ${job.extracted_target}`;
 
-    await setJobMessage(jobId, assistantContent);
+    const failedNote = failedChunks.length > 0
+      ? billingErrorMsg !== null
+        ? `\n\nNote: Billing quota was exhausted — ${formatTimeRange(failedChunks)} of the video was not analyzed. Clips shown are from the portion that completed.`
+        : `\n\nNote: ${failedChunks.length} chunk(s) could not be processed — ${formatTimeRange(failedChunks)} of the original video was skipped.`
+      : "";
+    await setJobMessage(jobId, assistantContent + failedNote);
     await setJobStatus(jobId, { status: "done" });
 
     console.log(`[jobs] ${jobId} done — ${clipRows.length} clip(s)`);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[jobs] ${jobId} failed: ${message}`);
+    const rawMessage = err instanceof Error ? err.message : String(err);
+    console.error(`[jobs] ${jobId} failed: ${rawMessage}`);
 
-    await setJobMessage(jobId, `Something went wrong: ${message}`);
-    await setJobStatus(jobId, { status: "error", error_message: message });
+    let userMessage: string;
+    if (billingErrorMsg !== null) {
+      userMessage = billingErrorMsg;
+    } else if (isStorageQuotaError(err)) {
+      userMessage = "Gemini file storage is full and could not be freed. Delete some conversations to free space, then retry.";
+    } else if (isBillingQuotaError(err)) {
+      userMessage = "Your Gemini API quota has been exhausted. Please check your billing details or wait for the quota to reset.";
+    } else {
+      userMessage = `Something went wrong: ${rawMessage}`;
+    }
+
+    await setJobMessage(jobId, userMessage);
+    await setJobStatus(jobId, { status: "error", error_message: userMessage });
   } finally {
     await rm(tmpJobDir, { recursive: true, force: true });
   }

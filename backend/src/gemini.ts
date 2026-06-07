@@ -28,6 +28,71 @@ async function sleep(ms: number) {
   await new Promise((r) => setTimeout(r, ms));
 }
 
+function extractGeminiFileName(uri: string): string | null {
+  const match = uri.match(/\/v1beta\/(files\/[^/?]+)/);
+  return match?.[1] ?? null;
+}
+
+export function isStorageQuotaError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes("file_storage_bytes");
+}
+
+export function isBillingQuotaError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes("billing_not_enabled") ||
+    msg.includes("check your plan and billing") ||
+    msg.includes("per_day") ||
+    msg.includes("free_tier") ||
+    msg.includes("insufficient_quota")
+  );
+}
+
+async function evictGeminiFilesForOtherConversations(conversationId: string): Promise<number> {
+  const ai = getClient();
+
+  const { data: activeJobs } = await db
+    .from("jobs")
+    .select("conversation_id")
+    .in("status", ["extracting_target", "analyzing", "extracting_clips", "stitching"]);
+
+  const protectedConvIds = new Set<string>(
+    (activeJobs ?? []).map((j: { conversation_id: string }) => j.conversation_id),
+  );
+  protectedConvIds.add(conversationId);
+
+  const { data: allChunks } = await db
+    .from("video_chunks")
+    .select("id, gemini_file_id, conversation_id")
+    .not("gemini_file_id", "is", null)
+    .order("gemini_expires_at", { ascending: true });
+
+  if (!allChunks?.length) return 0;
+
+  const toEvict = (allChunks as { id: string; gemini_file_id: string; conversation_id: string }[])
+    .filter((row) => !protectedConvIds.has(row.conversation_id));
+
+  if (!toEvict.length) return 0;
+
+  await Promise.allSettled(
+    toEvict.map(async (row) => {
+      const name = extractGeminiFileName(row.gemini_file_id);
+      if (name) {
+        try { await ai.files.delete({ name }); } catch { /* may already be expired */ }
+      }
+    }),
+  );
+
+  await db
+    .from("video_chunks")
+    .update({ gemini_file_id: null, gemini_expires_at: null, updated_at: new Date().toISOString() })
+    .in("id", toEvict.map((r) => r.id));
+
+  console.log(`[gemini] evicted ${toEvict.length} Gemini file(s) from other conversations to free storage`);
+  return toEvict.length;
+}
+
 async function uploadAndWait(
   filePath: string,
 ): Promise<{ fileUri: string; expiresAt: Date }> {
@@ -125,7 +190,25 @@ export async function ensureChunksReady(
         uploadPath = slowedPath;
       }
 
-      const { fileUri, expiresAt } = await uploadAndWait(uploadPath);
+      let uploadResult: { fileUri: string; expiresAt: Date };
+      try {
+        uploadResult = await uploadAndWait(uploadPath);
+      } catch (uploadErr) {
+        if (isStorageQuotaError(uploadErr)) {
+          console.warn("[gemini] Storage quota hit — evicting files from other conversations");
+          const evicted = await evictGeminiFilesForOtherConversations(conversationId);
+          if (evicted === 0) {
+            throw new Error(
+              "Gemini file storage is full and no files from other conversations could be freed. " +
+              "Delete some conversations or wait for files to expire (up to 48 hours).",
+            );
+          }
+          uploadResult = await uploadAndWait(uploadPath);
+        } else {
+          throw uploadErr;
+        }
+      }
+      const { fileUri, expiresAt } = uploadResult;
       await safeUnlink(uploadPath);
 
       await db.from("video_chunks").upsert(
@@ -189,12 +272,17 @@ export async function extractTarget(prompt: string): Promise<PreStepResult> {
   }
 }
 
-function retryDelayMs(err: unknown): number | null {
+export function retryDelayMs(err: unknown): number | null {
   const msg = err instanceof Error ? err.message : String(err);
   if (!msg.includes("RESOURCE_EXHAUSTED") && !msg.includes("429")) return null;
+  if (isBillingQuotaError(err)) return null; // Hard quota — not retryable
   const match = msg.match(/"retryDelay":\s*"([\d.]+)s"/);
   // Honour the server-specified delay + 2s buffer, or fall back to 60s.
   return match ? Math.ceil(parseFloat(match[1])) * 1000 + 2_000 : 60_000;
+}
+
+export function estimateChunkTokens(chunkDurationSec: number): number {
+  return Math.ceil(chunkDurationSec * config.gemini.videoSlowdownFactor * config.gemini.analysisFps * 258);
 }
 
 const MAX_ANALYZE_RETRIES = 3;
@@ -203,6 +291,7 @@ export async function analyzeChunk(
   geminiFileUri: string,
   job: Job,
   chunkDurationSec: number,
+  signal?: AbortSignal,
 ): Promise<GeminiClipResult[]> {
   const ai = getClient();
 
@@ -228,7 +317,7 @@ export async function analyzeChunk(
             ],
           },
         ],
-        config: { responseMimeType: "application/json" },
+        config: { responseMimeType: "application/json", abortSignal: signal },
       });
 
       const text = response.candidates?.[0]?.content?.parts?.[0]?.text ?? "[]";
@@ -246,6 +335,10 @@ export async function analyzeChunk(
         return [];
       }
     } catch (err) {
+      // AbortError means a user-initiated cancel — propagate immediately.
+      if ((err as Error)?.name === "AbortError") throw err;
+      // Billing quota is not retryable — propagate immediately.
+      if (isBillingQuotaError(err)) throw err;
       lastErr = err;
       const delay = retryDelayMs(err);
       if (delay === null || attempt === MAX_ANALYZE_RETRIES) throw err;
