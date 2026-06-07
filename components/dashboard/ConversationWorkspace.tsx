@@ -8,6 +8,7 @@ import { ClipViewer } from "@/components/dashboard/ClipViewer";
 import { PromptInput } from "@/components/dashboard/PromptInput";
 import type { Clip, Conversation, Job, MessageWithClips } from "@/lib/types";
 import { relativeTime } from "@/lib/format";
+import { getBrowserClient } from "@/lib/supabase";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -113,16 +114,19 @@ function MessageRow({
   onJobSettled,
   onOpenClips,
   onJobRetried,
+  globallyBusy,
 }: {
   message: MessageWithClips;
   onJobSettled: (jobId: string, job: Job, clips: Clip[]) => void;
   onOpenClips: (job: Job, clips: Clip[]) => void;
   onJobRetried: () => void;
+  globallyBusy: boolean;
 }) {
   const time = relativeTime(message.created_at);
 
   const handleRetry = async (jobId: string) => {
-    await fetch(`/api/jobs/${jobId}/retry`, { method: "POST" });
+    const res = await fetch(`/api/jobs/${jobId}/retry`, { method: "POST" });
+    if (!res.ok) return;
     onJobRetried();
   };
 
@@ -165,9 +169,11 @@ function MessageRow({
               <button
                 type="button"
                 onClick={() => void handleRetry(message.job_id!)}
-                className="mt-2 text-[11px] text-blue-400 hover:text-blue-300 transition-colors"
+                disabled={globallyBusy}
+                title={globallyBusy ? "Another job is processing — wait for it to finish" : undefined}
+                className="mt-2 text-[11px] text-blue-400 hover:text-blue-300 disabled:text-zinc-600 disabled:cursor-not-allowed transition-colors"
               >
-                Retry →
+                {globallyBusy ? "Retry (job running...)" : "Retry →"}
               </button>
             </div>
             <p className="text-[10px] text-zinc-600">{relativeTime(message.created_at)}</p>
@@ -205,11 +211,22 @@ const VIEWER_MIN_WIDTH = 320;  // px — matches previous fixed w-80
 const VIEWER_MAX_WIDTH = 580;  // px — generous but won't crush the chat area
 const STORAGE_KEY = "hoops-ai:clip-viewer-width";
 
+const ACTIVE_JOB_STATUSES = [
+  "pending",
+  "extracting_target",
+  "analyzing",
+  "extracting_clips",
+  "stitching",
+  "cancelling",
+];
+const TERMINAL_JOB_STATUSES = ["done", "error", "unsupported", "cancelled"];
+
 export function ConversationWorkspace({ conversationId }: { conversationId: string }) {
   const [data, setData] = useState<WorkspaceData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeJob, setActiveJob] = useState(false);
+  const [globallyBusy, setGloballyBusy] = useState(false);
   const [viewer, setViewer] = useState<{ job: Job; clips: Clip[] } | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
@@ -277,6 +294,43 @@ export function ConversationWorkspace({ conversationId }: { conversationId: stri
   }, [conversationId]);
 
   useEffect(() => { void load(); }, [load]);
+
+  // Watch all job changes to keep globallyBusy accurate.
+  useEffect(() => {
+    const supabase = getBrowserClient();
+
+    async function syncGloballyBusy() {
+      try {
+        const res = await fetch("/api/jobs/active");
+        const { count } = await res.json() as { count: number };
+        setGloballyBusy(count > 0);
+      } catch { /* ignore transient errors */ }
+    }
+
+    const channel = supabase
+      .channel("globally-active-jobs")
+      .on(
+        "postgres_changes",
+        { event: "INSERT", schema: "public", table: "jobs" },
+        () => { setGloballyBusy(true); },
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "jobs" },
+        async (payload) => {
+          const job = payload.new as { status: string };
+          if (TERMINAL_JOB_STATUSES.includes(job.status)) {
+            // A job just finished — fetch to see if any others are still running.
+            await syncGloballyBusy();
+          } else if (ACTIVE_JOB_STATUSES.includes(job.status)) {
+            setGloballyBusy(true);
+          }
+        },
+      )
+      .subscribe(() => { void syncGloballyBusy(); });
+
+    return () => { void channel.unsubscribe(); };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-scroll to bottom on new messages
   useEffect(() => {
@@ -456,6 +510,7 @@ export function ConversationWorkspace({ conversationId }: { conversationId: stri
                   onJobSettled={handleJobSettled}
                   onOpenClips={(job, clips) => setViewer({ job, clips })}
                   onJobRetried={() => void load()}
+                  globallyBusy={globallyBusy}
                 />
               ))}
               <div ref={bottomRef} />

@@ -23,6 +23,27 @@ export async function POST(
       return NextResponse.json({ error: "Job cannot be retried." }, { status: 409 });
     }
 
+    // Block retry when any other job is currently active (one-at-a-time constraint).
+    const ACTIVE_STATUSES = [
+      "pending",
+      "extracting_target",
+      "analyzing",
+      "extracting_clips",
+      "stitching",
+      "cancelling",
+    ];
+    const { count: activeCount } = await db
+      .from("jobs")
+      .select("id", { count: "exact", head: true })
+      .in("status", ACTIVE_STATUSES);
+
+    if ((activeCount ?? 0) > 0) {
+      return NextResponse.json(
+        { error: "Another job is currently processing. Wait for it to finish, then retry." },
+        { status: 409 },
+      );
+    }
+
     // Fetch existing clips for cleanup
     const { data: clips } = await db
       .from("clips")

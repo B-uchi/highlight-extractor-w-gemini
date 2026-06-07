@@ -263,7 +263,7 @@ export function JobStatusCard({ jobId, onSettled }: JobStatusCardProps) {
 
               {showAnalysisExtras && job.chunks_total != null && (
                 <p className="ml-3.5 text-[10px] text-zinc-600">
-                  ~{job.chunks_total * 6} min est. · {job.chunks_total} chunk{job.chunks_total !== 1 ? "s" : ""}
+                  ~{job.chunks_total} chunk{job.chunks_total !== 1 ? "s" : ""}
                 </p>
               )}
 
