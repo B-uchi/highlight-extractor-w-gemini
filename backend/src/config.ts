@@ -51,8 +51,9 @@ export const config = {
     chunkSec: Number(process.env.QWEN_CHUNK_SEC ?? 60),   // ~1 min: recall-safe + batch-friendly
     maxModelLen: Number(process.env.QWEN_MAX_MODEL_LEN ?? 40_960),
     // Chunks processed CONCURRENTLY in one Modal call via vLLM continuous batching.
-    // 4 × ~22K ≈ 88K tokens of KV — fits the ~200K KV budget on an 80GB A100 (FP8).
-    batchSize: Number(process.env.QWEN_BATCH_SIZE ?? 4),
+    // Measured KV cache = 144K tokens; each chunk ~14K (budget_pct ~35%) → ~10 fit.
+    // 8 × ~14K ≈ 112K (~78% of KV) — strong batching with headroom.
+    batchSize: Number(process.env.QWEN_BATCH_SIZE ?? 8),
     // Concurrent Modal CALLS = warm A100s. With batching, 1–2 saturates the GPU,
     // so keep this small (each container is billed for the whole job).
     proposalParallelism: Number(process.env.QWEN_PROPOSAL_PARALLELISM ?? 2),

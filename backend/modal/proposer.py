@@ -20,6 +20,7 @@ import os
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import modal
 
@@ -131,6 +132,14 @@ def _validate(clips: list, chunk_sec: float) -> list:
     return out
 
 
+def _safe_prep(fn, it):
+    try:
+        return fn(it)
+    except Exception as exc:
+        print(f"[proposer] prep error: {exc}")
+        return None
+
+
 @app.function(
     image=image,
     gpu="A100-80GB",
@@ -169,6 +178,41 @@ def propose_clips(
         except Exception:
             return 0
 
+    # Download + decode (decord) each chunk. This is CPU/IO-heavy and was the serial
+    # bottleneck before batching — run it across threads so all chunks prep concurrently
+    # (decord releases the GIL during decode; requests blocks on IO).
+    def _prep(it):
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            vp = f.name
+            with requests.get(it["video_url"], stream=True, timeout=120) as r:
+                r.raise_for_status()
+                for piece in r.iter_content(chunk_size=1 << 20):
+                    f.write(piece)
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "video", "video": vp, "fps": fps, "max_pixels": max_pixels},
+                {"type": "text", "text": it["prompt"]},
+            ],
+        }]
+        prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        try:
+            _, video_inputs, video_kwargs = process_vision_info(
+                messages, image_patch_size=patch_size,
+                return_video_kwargs=True, return_video_metadata=True,
+            )
+        except TypeError:
+            _, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
+        return {
+            "vp": vp,
+            "frames": _frame_count(video_inputs[0]) if video_inputs else 0,
+            "gen_input": {
+                "prompt": prompt,
+                "multi_modal_data": {"video": video_inputs},
+                "mm_processor_kwargs": video_kwargs,
+            },
+        }
+
     results = [[] for _ in items]
     video_paths = []
     gen_inputs = []
@@ -176,46 +220,18 @@ def propose_clips(
     valid_idx = []  # item indices that built successfully
 
     try:
-        for i, it in enumerate(items):
-            try:
-                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-                    vp = f.name
-                    with requests.get(it["video_url"], stream=True, timeout=120) as r:
-                        r.raise_for_status()
-                        for piece in r.iter_content(chunk_size=1 << 20):
-                            f.write(piece)
-                video_paths.append(vp)
-
-                messages = [{
-                    "role": "user",
-                    "content": [
-                        {"type": "video", "video": vp, "fps": fps, "max_pixels": max_pixels},
-                        {"type": "text", "text": it["prompt"]},
-                    ],
-                }]
-                prompt = processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
-                )
-                # vLLM 0.11's Qwen3-VL parser unpacks each video item as (array, metadata).
-                try:
-                    _, video_inputs, video_kwargs = process_vision_info(
-                        messages, image_patch_size=patch_size,
-                        return_video_kwargs=True, return_video_metadata=True,
-                    )
-                except TypeError:
-                    _, video_inputs, video_kwargs = process_vision_info(
-                        messages, return_video_kwargs=True,
-                    )
-
-                frame_counts.append(_frame_count(video_inputs[0]) if video_inputs else 0)
-                gen_inputs.append({
-                    "prompt": prompt,
-                    "multi_modal_data": {"video": video_inputs},
-                    "mm_processor_kwargs": video_kwargs,
-                })
-                valid_idx.append(i)
-            except Exception as exc:
-                print(f"[proposer] item {i} prep failed: {exc}")
+        t_prep0 = time.time()
+        with ThreadPoolExecutor(max_workers=max(1, len(items))) as ex:
+            prepped = list(ex.map(lambda it: _safe_prep(_prep, it), items))
+        for i, p in enumerate(prepped):
+            if p is None:
+                print(f"[proposer] item {i} prep failed")
+                continue
+            video_paths.append(p["vp"])
+            gen_inputs.append(p["gen_input"])
+            frame_counts.append(p["frames"])
+            valid_idx.append(i)
+        prep_secs = time.time() - t_prep0
 
         if not gen_inputs:
             return results
@@ -247,7 +263,8 @@ def propose_clips(
         per_chunk = infer_secs / max(1, len(gen_inputs))
         print(
             f"[QWEN-TUNE] BATCH_DONE items={len(items)} processed={len(gen_inputs)} "
-            f"batch_infer_secs={infer_secs:.1f} per_chunk_secs={per_chunk:.1f} load_secs={load_secs:.1f}"
+            f"prep_secs={prep_secs:.1f} batch_infer_secs={infer_secs:.1f} "
+            f"per_chunk_secs={per_chunk:.1f} load_secs={load_secs:.1f}"
         )
         return results
     except Exception as exc:

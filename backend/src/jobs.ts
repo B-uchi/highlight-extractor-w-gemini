@@ -389,17 +389,17 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
           }
           console.warn(`[jobs] propose batch failed (${group.length} chunks): ${msg}`);
         } finally {
+          // Persist as soon as THIS batch-call returns — finer UI progress than per-wave,
+          // and a crash/quota past this point never re-runs Modal for these chunks.
           analyzed += group.length;
+          await setJobStatus(jobId, {
+            chunks_analyzed: analyzed,
+            chunk_cache: Object.fromEntries(proposalCache),
+            ...(failed.length ? { failed_chunks: failed } : {}),
+          });
         }
       }),
     );
-
-    // Persist after every wave — a crash/quota past this point never re-runs Modal.
-    await setJobStatus(jobId, {
-      chunks_analyzed: analyzed,
-      chunk_cache: Object.fromEntries(proposalCache),
-      ...(failed.length ? { failed_chunks: failed } : {}),
-    });
   }
 
   if (proposalCache.size === 0) {
