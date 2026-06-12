@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { db } from "./db";
 import { downloadFromR2, uploadFileToR2, getPresignedUrl, safeUnlink, objectExists } from "./storage";
 import { cutClip, stitchClips, extractSegment } from "./ffmpeg";
-import { analyzeChunk, ensureChunksReady, extractTarget, verifyClip, retryDelayMs, estimateChunkTokens, isBillingQuotaError, isStorageQuotaError } from "./gemini";
+import { analyzeChunk, ensureChunksReady, extractTarget, verifyClip, retryDelayMs, estimateChunkTokens, isBillingQuotaError, isHardBillingError, isStorageQuotaError } from "./gemini";
 import { proposeClipsBatch } from "./modal";
 import { config } from "./config";
 import type { FailedChunk, GeminiClipResult, Job, JobMode } from "./types";
@@ -344,62 +344,74 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
   await setJobStatus(jobId, { chunks_total: chunkCount, chunks_analyzed: analyzed });
 
   // vLLM batching: group pending chunks into batches; ONE Modal call processes a whole
-  // batch concurrently on the GPU. `parallelism` such batch-calls run across warm A100s.
+  // batch concurrently on the GPU. A CONTINUOUS WORKER POOL of `parallelism` workers keeps
+  // that many batch-calls in flight at all times — the instant a container finishes a batch
+  // it pulls the next group (Modal routes it straight back to the still-warm container).
+  // This avoids the head-of-line blocking + idle-scaledown-then-cold-restart of fixed waves.
   type ChunkInfo = { index: number; startSec: number; endSec: number };
   const pendingChunks: ChunkInfo[] = chunks.filter((c) => !proposalCache.has(c.index));
   const batchSize = Math.max(1, config.qwen.batchSize);
-  const groups: ChunkInfo[][] = [];
+  const queue: ChunkInfo[][] = [];
   for (let i = 0; i < pendingChunks.length; i += batchSize) {
-    groups.push(pendingChunks.slice(i, i + batchSize));
+    queue.push(pendingChunks.slice(i, i + batchSize));
   }
 
-  for (let g = 0; g < groups.length; g += parallelism) {
-    if (await checkCancelled(jobId)) {
-      await setJobMessage(jobId, "Job was cancelled during proposal.");
-      await setJobStatus(jobId, { status: "cancelled" });
-      return;
-    }
-    const concurrent = groups.slice(g, g + parallelism);
+  let cancelled = false;
 
-    await Promise.all(
-      concurrent.map(async (group) => {
-        try {
-          // Ensure each chunk's R2 object exists (per-video cache), presign, build items.
-          const items = await Promise.all(
-            group.map(async (chunk) => {
-              const dur = chunk.endSec - chunk.startSec;
-              const chunkKey = `qwen-chunks/${job.conversation_id}/${chunkSec}s/${chunk.index}.mp4`;
-              if (!(await objectExists(chunkKey))) {
-                const localChunk = path.join(tmpJobDir, `qchunk_${chunk.index}.mp4`);
-                await extractSegment(sourcePath, chunk.startSec, dur, localChunk);
-                await uploadFileToR2(localChunk, chunkKey);
-                await safeUnlink(localChunk);
-              }
-              const url = await getPresignedUrl(chunkKey, 1800);
-              return { chunkUrl: url, chunkSec: dur };
-            }),
-          );
-          const lists = await proposeClipsBatch(job, items);
-          group.forEach((chunk, idx) => proposalCache.set(chunk.index, lists[idx] ?? []));
-        } catch (err) {
-          // Whole batch failed — record each chunk so a retry resumes just these.
-          const msg = (err as Error)?.message ?? String(err);
-          for (const chunk of group) {
-            failed.push({ chunkIndex: chunk.index, startSec: chunk.startSec, endSec: chunk.endSec, error: msg });
+  const processGroup = async (group: ChunkInfo[]) => {
+    try {
+      // Ensure each chunk's R2 object exists (per-video cache), presign, build items.
+      const items = await Promise.all(
+        group.map(async (chunk) => {
+          const dur = chunk.endSec - chunk.startSec;
+          const chunkKey = `qwen-chunks/${job.conversation_id}/${chunkSec}s/${chunk.index}.mp4`;
+          if (!(await objectExists(chunkKey))) {
+            const localChunk = path.join(tmpJobDir, `qchunk_${chunk.index}.mp4`);
+            await extractSegment(sourcePath, chunk.startSec, dur, localChunk);
+            await uploadFileToR2(localChunk, chunkKey);
+            await safeUnlink(localChunk);
           }
-          console.warn(`[jobs] propose batch failed (${group.length} chunks): ${msg}`);
-        } finally {
-          // Persist as soon as THIS batch-call returns — finer UI progress than per-wave,
-          // and a crash/quota past this point never re-runs Modal for these chunks.
-          analyzed += group.length;
-          await setJobStatus(jobId, {
-            chunks_analyzed: analyzed,
-            chunk_cache: Object.fromEntries(proposalCache),
-            ...(failed.length ? { failed_chunks: failed } : {}),
-          });
-        }
-      }),
-    );
+          const url = await getPresignedUrl(chunkKey, 1800);
+          return { chunkUrl: url, chunkSec: dur };
+        }),
+      );
+      const lists = await proposeClipsBatch(job, items);
+      group.forEach((chunk, idx) => proposalCache.set(chunk.index, lists[idx] ?? []));
+    } catch (err) {
+      // Whole batch failed — record each chunk so a retry resumes just these.
+      const msg = (err as Error)?.message ?? String(err);
+      for (const chunk of group) {
+        failed.push({ chunkIndex: chunk.index, startSec: chunk.startSec, endSec: chunk.endSec, error: msg });
+      }
+      console.warn(`[jobs] propose batch failed (${group.length} chunks): ${msg}`);
+    } finally {
+      // Persist the moment THIS batch returns — fine-grained UI progress, and a crash/quota
+      // past this point never re-runs Modal for these chunks.
+      analyzed += group.length;
+      await setJobStatus(jobId, {
+        chunks_analyzed: analyzed,
+        chunk_cache: Object.fromEntries(proposalCache),
+        ...(failed.length ? { failed_chunks: failed } : {}),
+      });
+    }
+  };
+
+  // Each worker pulls groups until the queue is empty — fast containers stay fed.
+  const worker = async () => {
+    while (!cancelled) {
+      if (await checkCancelled(jobId)) { cancelled = true; return; }
+      const group = queue.shift();
+      if (!group) return;
+      await processGroup(group);
+    }
+  };
+
+  await Promise.all(Array.from({ length: parallelism }, () => worker()));
+
+  if (cancelled) {
+    await setJobMessage(jobId, "Job was cancelled during proposal.");
+    await setJobStatus(jobId, { status: "cancelled" });
+    return;
   }
 
   if (proposalCache.size === 0) {
@@ -457,20 +469,29 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
           return { idx, verdict: { confirmed: false, confidence: 0, reason: "out of bounds" } as Verdict };
         }
         const vPath = path.join(tmpJobDir, `verify_${idx}.mp4`);
-        await cutClip(sourcePath, cutStart, cutEnd, vPath);
-        const res = await verifyClip(vPath, job, cutEnd - cutStart);
-        await safeUnlink(vPath);
-        console.log(`[PV-VERIFY] idx=${idx} confirmed=${res.confirmed} conf=${res.confidence.toFixed(2)} reason="${res.reason.replace(/"/g, "'")}"`);
-        return { idx, verdict: res };
+        try {
+          await cutClip(sourcePath, cutStart, cutEnd, vPath);
+          const res = await verifyClip(vPath, job, cutEnd - cutStart);
+          console.log(`[PV-VERIFY] idx=${idx} confirmed=${res.confirmed} conf=${res.confidence.toFixed(2)} reason="${res.reason.replace(/"/g, "'")}"`);
+          return { idx, verdict: res };
+        } catch (err) {
+          // verifyClip only throws on TRUE hard billing — propagate that to stop the job
+          // (resumable). Any other error (ffmpeg, etc.) → reject this one clip, keep going.
+          if (isHardBillingError(err)) throw err;
+          console.warn(`[jobs] verify clip ${idx} errored (reject): ${(err as Error)?.message}`);
+          return { idx, verdict: { confirmed: false, confidence: 0, reason: "verify error" } as Verdict };
+        } finally {
+          await safeUnlink(vPath);
+        }
       }),
     );
     for (const r of results) {
       if (r.status === "fulfilled") {
         verdicts.set(r.value.idx, r.value.verdict);
       } else {
-        // verifyClip only throws on quota / exhausted-rate-limit — both resumable.
+        // The only thing verifyClip rethrows is hard account/billing — genuinely terminal.
         verifyStopped = true;
-        if (isBillingQuotaError(r.reason)) billingHit = true;
+        billingHit = true;
       }
     }
     // Persist verdicts every batch — a crash/quota never re-verifies these candidates.
