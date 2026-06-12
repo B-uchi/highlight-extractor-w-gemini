@@ -61,9 +61,13 @@ export const config = {
 
   // Gemini verifier — confirms each small candidate clip inline (no Files API, no slowdown).
   verifier: {
-    model: process.env.VERIFY_MODEL ?? "gemini-3.1-pro-preview",
+    // GA model by default. gemini-3.1-pro-preview uses a *shared* preview quota and throws
+    // 429/RESOURCE_EXHAUSTED from global congestion even at near-zero personal usage (the
+    // "ghost 429" — paid keys can be stuck on Free-Tier limits for 3.x for 24–48h). A GA
+    // model has real provisioned quota. Set VERIFY_MODEL=gemini-3.1-pro-preview to opt back in.
+    model: process.env.VERIFY_MODEL ?? "gemini-2.5-pro",
     fps: Number(process.env.VERIFY_FPS ?? 6),
-    parallelism: Number(process.env.VERIFY_PARALLELISM ?? 4), // keep well under 1000 RPM
+    parallelism: Number(process.env.VERIFY_PARALLELISM ?? 4),
     minConfidence: Number(process.env.VERIFY_MIN_CONFIDENCE ?? 0.6),
     preActionPad: Number(process.env.VERIFY_PRE_PAD ?? 2.5),
     postActionPad: Number(process.env.VERIFY_POST_PAD ?? 2.5),

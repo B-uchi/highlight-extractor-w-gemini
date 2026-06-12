@@ -54,6 +54,20 @@ export function isBillingQuotaError(err: unknown): boolean {
   );
 }
 
+// TRUE hard-stop billing errors — account/billing disabled, NOT a transient rate limit.
+// Preview models (e.g. gemini-3.1-pro-preview) return 429s whose quota metric names contain
+// "per_day"/"free_tier" even on paid accounts; those are rate limits to retry, not billing death.
+export function isHardBillingError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes("billing_not_enabled") ||
+    msg.includes("check your plan and billing") ||
+    msg.includes("billing account") ||
+    msg.includes("account is not enabled") ||
+    msg.includes("service_disabled")
+  );
+}
+
 async function evictGeminiFilesForOtherConversations(conversationId: string): Promise<number> {
   const ai = getClient();
 
@@ -357,7 +371,18 @@ export async function analyzeChunk(
 // ── Verifier (proposer-verifier pipeline) ────────────────────────────────────
 // Confirm a single small candidate clip INLINE — no Files API upload, no slowdown.
 // The clip is a 6–30s mp4 cut from the original; base64-inlined into the request.
-const MAX_VERIFY_RETRIES = 3;
+const MAX_VERIFY_RETRIES = 5;
+
+function isRateLimit(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err));
+  return msg.includes("429") || msg.includes("RESOURCE_EXHAUSTED");
+}
+
+function parseRetryDelayMs(err: unknown): number {
+  const msg = err instanceof Error ? err.message : String(err);
+  const m = msg.match(/"retryDelay":\s*"([\d.]+)s"/);
+  return m ? Math.ceil(parseFloat(m[1])) * 1000 + 2_000 : 15_000;
+}
 
 export async function verifyClip(
   clipPath: string,
@@ -368,7 +393,6 @@ export async function verifyClip(
   const prompt = buildGeminiVerifierPrompt(job, clipDurationSec, config.verifier.minConfidence);
   const base64 = (await readFile(clipPath)).toString("base64");
 
-  let lastErr: unknown;
   for (let attempt = 1; attempt <= MAX_VERIFY_RETRIES; attempt++) {
     try {
       const response = await ai.models.generateContent({
@@ -397,20 +421,24 @@ export async function verifyClip(
         reason: parsed.reason ?? "",
       };
     } catch (err) {
-      if (isBillingQuotaError(err)) throw err;
-      lastErr = err;
-      const delay = retryDelayMs(err);
-      if (delay === null || attempt === MAX_VERIFY_RETRIES) {
-        // On a non-retryable parse/other error, fail safe: reject (verifier must be strict).
-        if (delay === null) {
-          console.warn(`[gemini] verify error (treating as reject): ${(err as Error)?.message}`);
-          return { confirmed: false, confidence: 0, reason: "verification error" };
-        }
-        throw err;
+      // Only a genuine account/billing stop should ever halt the job (it's resumable upstream).
+      if (isHardBillingError(err)) throw err;
+
+      // Rate limits (incl. preview models whose 429s mention per_day/free_tier) are transient —
+      // back off and retry; the server retryDelay is honored when present.
+      if (isRateLimit(err) && attempt < MAX_VERIFY_RETRIES) {
+        const delay = parseRetryDelayMs(err);
+        const detail = ((err as Error)?.message ?? String(err)).slice(0, 240).replace(/\s+/g, " ");
+        console.warn(`[gemini] verify rate-limited (retry ${attempt + 1}/${MAX_VERIFY_RETRIES}, ${delay}ms) — ${detail}`);
+        await sleep(delay);
+        continue;
       }
-      console.warn(`[gemini] 429 on verify — waiting ${delay}ms before retry ${attempt + 1}/${MAX_VERIFY_RETRIES}`);
-      await sleep(delay);
+
+      // Exhausted rate-limit retries, or a non-billing error (parse/network): fail this ONE
+      // clip safely as a reject so the rest of the job keeps going — never a false "billing" stop.
+      console.warn(`[gemini] verify failed (treating as reject): ${(err as Error)?.message}`);
+      return { confirmed: false, confidence: 0, reason: "verification error" };
     }
   }
-  throw lastErr;
+  return { confirmed: false, confidence: 0, reason: "verification error" };
 }
