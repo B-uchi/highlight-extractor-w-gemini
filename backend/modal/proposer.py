@@ -40,6 +40,7 @@ image = (
         "vllm>=0.11.0",
         "qwen-vl-utils==0.0.14",
         "transformers>=4.57.0",
+        "decord>=0.6.0",  # self-contained video reader for qwen-vl-utils
         "requests>=2.31.0",
     )
     .env({
@@ -49,6 +50,9 @@ image = (
         # sampler tries to JIT-build a CUDA kernel at startup and fails. We decode greedily
         # (temperature=0), so vLLM's native PyTorch sampler is equivalent and needs no build.
         "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        # Force decord — the torchvision shipped with vLLM lacks read_video, and decord is
+        # faster and self-contained. Avoids the "torchvision.io has no attribute read_video" crash.
+        "FORCE_QWENVL_VIDEO_READER": "decord",
     })
 )
 
@@ -168,16 +172,39 @@ def propose_clips(
         prompt = processor.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True,
         )
-        _, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
 
-        frames = 0
+        # vLLM 0.11's Qwen3-VL parser unpacks each video item as `(array, metadata)`,
+        # so process_vision_info must return metadata-bearing tuples. The newer
+        # qwen-vl-utils takes return_video_metadata + image_patch_size; fall back for older.
+        patch_size = getattr(getattr(processor, "image_processor", None), "patch_size", 16)
         try:
-            frames = int(video_inputs[0].shape[0]) if video_inputs else 0
-        except Exception:
-            pass
+            _, video_inputs, video_kwargs = process_vision_info(
+                messages,
+                image_patch_size=patch_size,
+                return_video_kwargs=True,
+                return_video_metadata=True,
+            )
+        except TypeError:
+            # Older qwen-vl-utils without the metadata kwargs.
+            _, video_inputs, video_kwargs = process_vision_info(
+                messages, return_video_kwargs=True,
+            )
 
-        sampling = SamplingParams(temperature=0.0, max_tokens=8192, repetition_penalty=1.05)
+        # Each item may be a (video_array, metadata) tuple (Qwen3-VL) or a bare array.
+        def _frame_count(v):
+            arr = v[0] if isinstance(v, (tuple, list)) else v
+            try:
+                return int(arr.shape[0])
+            except Exception:
+                return 0
+
+        frames = _frame_count(video_inputs[0]) if video_inputs else 0
+
+        # Thinking model burns output tokens on reasoning before the JSON answer —
+        # give generous headroom so the final array isn't truncated (→ silent []).
+        sampling = SamplingParams(temperature=0.0, max_tokens=16384, repetition_penalty=1.05)
         t_inf0 = time.time()
+        # Pass video_inputs through as-is (tuples carry the metadata vLLM requires).
         outputs = llm.generate(
             [{
                 "prompt": prompt,

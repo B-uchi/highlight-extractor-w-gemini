@@ -44,10 +44,14 @@ export const config = {
     appName: process.env.QWEN_MODAL_APP ?? "video-highlight-proposer",
     functionName: process.env.QWEN_MODAL_FUNCTION ?? "propose_clips",
     fps: Number(process.env.QWEN_FPS ?? 6),
-    maxPixels: Number(process.env.QWEN_MAX_PIXELS ?? 147_456), // ≈512×288 → ~188 tok/frame
-    chunkSec: Number(process.env.QWEN_CHUNK_SEC ?? 24),
+    // Measured: ~70 tok/frame at 147456 px (not 188). 48s × ~7.5 eff-fps × ~75 ≈ 28K
+    // prompt tokens — well under maxModelLen. Bigger chunks ≈ halve Modal calls/cost.
+    maxPixels: Number(process.env.QWEN_MAX_PIXELS ?? 147_456), // ≈512×288 → ~70 tok/frame
+    chunkSec: Number(process.env.QWEN_CHUNK_SEC ?? 48),
     maxModelLen: Number(process.env.QWEN_MAX_MODEL_LEN ?? 40_960),
-    proposalParallelism: Number(process.env.QWEN_PROPOSAL_PARALLELISM ?? 3),
+    // Each concurrent call lets Modal autoscale another warm A100. Total GPU-compute is
+    // conserved — this just spreads chunks across more GPUs instead of queueing them.
+    proposalParallelism: Number(process.env.QWEN_PROPOSAL_PARALLELISM ?? 6),
   },
 
   // Gemini verifier — confirms each small candidate clip inline (no Files API, no slowdown).
