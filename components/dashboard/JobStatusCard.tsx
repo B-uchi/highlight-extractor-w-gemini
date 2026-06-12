@@ -26,6 +26,12 @@ function statusLabel(job: Job): string {
       return job.chunks_total != null
         ? `Analyzing video (${job.chunks_analyzed}/${job.chunks_total} chunks)...`
         : "Analyzing video...";
+    case "proposing":
+      return job.chunks_total != null
+        ? `Proposing clips (${job.chunks_analyzed}/${job.chunks_total} chunks)...`
+        : "Proposing clips...";
+    case "verifying":
+      return `Verifying candidates (${job.clips_done}/${job.clips_total ?? "?"})...`;
     case "extracting_clips":
       return `Cutting clips (${job.clips_done}/${job.clips_total ?? "?"})...`;
     case "stitching": return "Stitching highlight reel...";
@@ -41,6 +47,8 @@ function statusLabel(job: Job): string {
 const STEPS: { status: Job["status"]; label: string }[] = [
   { status: "extracting_target", label: "Extracting action from prompt" },
   { status: "analyzing", label: "Analyzing video" },
+  { status: "proposing", label: "Proposing clips (Qwen)" },
+  { status: "verifying", label: "Verifying candidates (Gemini)" },
   { status: "extracting_clips", label: "Cutting clips" },
   { status: "stitching", label: "Stitching highlight reel" },
 ];
@@ -56,6 +64,7 @@ export function JobStatusCard({ jobId, onSettled }: JobStatusCardProps) {
   const settled = useRef(false);
   const channelRef = useRef<ReturnType<ReturnType<typeof getBrowserClient>["channel"]> | null>(null);
   const analyzingStartRef = useRef<number | null>(null);
+  const usedProposerRef = useRef(false);
 
   // Track when we enter / leave the analyzing state.
   useEffect(() => {
@@ -168,8 +177,14 @@ export function JobStatusCard({ jobId, onSettled }: JobStatusCardProps) {
   }
 
   const showStitch = isCompilation(job.mode);
+  // Once the job touches proposing/verifying, it's the proposer path; otherwise Gemini.
+  // usedProposerRef persists the choice so the step list stays consistent after analysis.
+  if (job.status === "proposing" || job.status === "verifying") usedProposerRef.current = true;
+  const usedProposer = usedProposerRef.current;
   const steps = STEPS.filter((s) => {
     if (s.status === "stitching" && !showStitch) return false;
+    if (s.status === "analyzing" && usedProposer) return false;
+    if ((s.status === "proposing" || s.status === "verifying") && !usedProposer) return false;
     return true;
   });
 
@@ -237,6 +252,12 @@ export function JobStatusCard({ jobId, onSettled }: JobStatusCardProps) {
           }
           if (step.status === "analyzing" && job.chunks_total != null) {
             label = `${step.label} (${job.chunks_analyzed}/${job.chunks_total})`;
+          }
+          if (step.status === "proposing" && job.chunks_total != null) {
+            label = `${step.label} (${job.chunks_analyzed}/${job.chunks_total})`;
+          }
+          if (step.status === "verifying" && job.clips_total != null) {
+            label = `${step.label} (${job.clips_done}/${job.clips_total})`;
           }
 
           const showAnalysisExtras = step.status === "analyzing" && isCurrent;

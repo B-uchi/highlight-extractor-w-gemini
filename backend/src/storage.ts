@@ -8,6 +8,7 @@ import {
   CreateMultipartUploadCommand,
   DeleteObjectCommand,
   GetObjectCommand,
+  HeadObjectCommand,
   PutObjectCommand,
   S3Client,
   UploadPartCommand,
@@ -95,6 +96,16 @@ export async function uploadFileToR2(localPath: string, key: string): Promise<vo
 
 export async function deleteFromR2(key: string): Promise<void> {
   await s3().send(new DeleteObjectCommand({ Bucket: config.r2.bucket, Key: key }));
+}
+
+/** True if the object already exists (used to reuse per-video Qwen chunks across prompts). */
+export async function objectExists(key: string): Promise<boolean> {
+  try {
+    await s3().send(new HeadObjectCommand({ Bucket: config.r2.bucket, Key: key }));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function getPresignedUrl(

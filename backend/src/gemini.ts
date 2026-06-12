@@ -1,5 +1,5 @@
 import path from "node:path";
-import { rm } from "node:fs/promises";
+import { rm, readFile } from "node:fs/promises";
 
 import { FileState, GoogleGenAI } from "@google/genai";
 
@@ -7,8 +7,13 @@ import { config } from "./config";
 import { extractSegment, slowdownVideo } from "./ffmpeg";
 import { db } from "./db";
 import { downloadFromR2, ensureTmpDir, safeUnlink } from "./storage";
-import type { GeminiClipResult, PreStepResult, VideoChunk, Job } from "./types";
-import { buildActionExtractionPrompt, buildCompilationPrompt, PRE_STEP_SYSTEM_PROMPT } from "./prompts";
+import type { GeminiClipResult, PreStepResult, VideoChunk, Job, VerifyResult } from "./types";
+import {
+  buildActionExtractionPrompt,
+  buildCompilationPrompt,
+  buildGeminiVerifierPrompt,
+  PRE_STEP_SYSTEM_PROMPT,
+} from "./prompts";
 
 const POLL_INTERVAL_MS = 3_000;
 const POLL_TIMEOUT_MS = 10 * 60_000;
@@ -343,6 +348,67 @@ export async function analyzeChunk(
       const delay = retryDelayMs(err);
       if (delay === null || attempt === MAX_ANALYZE_RETRIES) throw err;
       console.warn(`[gemini] 429 on chunk — waiting ${delay}ms before retry ${attempt + 1}/${MAX_ANALYZE_RETRIES}`);
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
+// ── Verifier (proposer-verifier pipeline) ────────────────────────────────────
+// Confirm a single small candidate clip INLINE — no Files API upload, no slowdown.
+// The clip is a 6–30s mp4 cut from the original; base64-inlined into the request.
+const MAX_VERIFY_RETRIES = 3;
+
+export async function verifyClip(
+  clipPath: string,
+  job: Job,
+  clipDurationSec: number,
+): Promise<VerifyResult> {
+  const ai = getClient();
+  const prompt = buildGeminiVerifierPrompt(job, clipDurationSec, config.verifier.minConfidence);
+  const base64 = (await readFile(clipPath)).toString("base64");
+
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= MAX_VERIFY_RETRIES; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model: config.verifier.model,
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                inlineData: { mimeType: "video/mp4", data: base64 },
+                videoMetadata: { fps: config.verifier.fps },
+              },
+              { text: prompt },
+            ],
+          },
+        ],
+        config: { responseMimeType: "application/json" },
+      });
+
+      const text = response.candidates?.[0]?.content?.parts?.[0]?.text ?? "{}";
+      const parsed = JSON.parse(text) as Partial<VerifyResult>;
+      const confidence = typeof parsed.confidence === "number" ? parsed.confidence : 0;
+      return {
+        confirmed: parsed.confirmed === true && confidence >= config.verifier.minConfidence,
+        confidence,
+        reason: parsed.reason ?? "",
+      };
+    } catch (err) {
+      if (isBillingQuotaError(err)) throw err;
+      lastErr = err;
+      const delay = retryDelayMs(err);
+      if (delay === null || attempt === MAX_VERIFY_RETRIES) {
+        // On a non-retryable parse/other error, fail safe: reject (verifier must be strict).
+        if (delay === null) {
+          console.warn(`[gemini] verify error (treating as reject): ${(err as Error)?.message}`);
+          return { confirmed: false, confidence: 0, reason: "verification error" };
+        }
+        throw err;
+      }
+      console.warn(`[gemini] 429 on verify — waiting ${delay}ms before retry ${attempt + 1}/${MAX_VERIFY_RETRIES}`);
       await sleep(delay);
     }
   }

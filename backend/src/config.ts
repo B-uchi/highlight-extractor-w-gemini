@@ -33,5 +33,32 @@ export const config = {
     analysisFps,
     minConfidence: Number(process.env.GEMINI_MIN_CONFIDENCE ?? 0.80),
   },
+
+  // "gemini" (default, baseline) or "proposer_verifier" (Qwen on Modal proposes, Gemini verifies).
+  analysisMode: (process.env.ANALYSIS_MODE ?? "gemini") as "gemini" | "proposer_verifier",
+
+  // Qwen3-VL-32B-Thinking proposer on Modal. Token budget per chunk ≈
+  // chunkSec × fps × (maxPixels / 784); must stay under maxModelLen minus ~10K for
+  // prompt + thinking output. Validate against [QWEN-TUNE] logs and retune.
+  qwen: {
+    appName: process.env.QWEN_MODAL_APP ?? "video-highlight-proposer",
+    functionName: process.env.QWEN_MODAL_FUNCTION ?? "propose_clips",
+    fps: Number(process.env.QWEN_FPS ?? 6),
+    maxPixels: Number(process.env.QWEN_MAX_PIXELS ?? 147_456), // ≈512×288 → ~188 tok/frame
+    chunkSec: Number(process.env.QWEN_CHUNK_SEC ?? 24),
+    maxModelLen: Number(process.env.QWEN_MAX_MODEL_LEN ?? 40_960),
+    proposalParallelism: Number(process.env.QWEN_PROPOSAL_PARALLELISM ?? 3),
+  },
+
+  // Gemini verifier — confirms each small candidate clip inline (no Files API, no slowdown).
+  verifier: {
+    model: process.env.VERIFY_MODEL ?? "gemini-3.1-pro-preview",
+    fps: Number(process.env.VERIFY_FPS ?? 6),
+    parallelism: Number(process.env.VERIFY_PARALLELISM ?? 4), // keep well under 1000 RPM
+    minConfidence: Number(process.env.VERIFY_MIN_CONFIDENCE ?? 0.6),
+    preActionPad: Number(process.env.VERIFY_PRE_PAD ?? 2.5),
+    postActionPad: Number(process.env.VERIFY_POST_PAD ?? 2.5),
+  },
+
   pollIntervalMs: Number(process.env.POLL_INTERVAL_MS ?? 30_000),
 };

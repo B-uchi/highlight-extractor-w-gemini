@@ -53,6 +53,8 @@ export type JobStatus =
   | "pending"
   | "extracting_target"
   | "analyzing"
+  | "proposing"
+  | "verifying"
   | "extracting_clips"
   | "stitching"
   | "done"

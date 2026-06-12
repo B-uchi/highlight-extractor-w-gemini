@@ -189,3 +189,124 @@ Set rank = chronological position (1 = earliest play found).
 
 ${OUTPUT_SCHEMA}`;
 }
+
+// ── Qwen3-VL-32B-Thinking proposer prompt ────────────────────────────────────
+// Stage 1 of the proposer-verifier pipeline. Deliberately LIBERAL: the Gemini
+// verifier removes false positives, so the proposer should over-propose rather
+// than miss. The model is a *thinking* model — it reasons, then must emit ONLY
+// a JSON array as its final output. Extremely explicit to avoid discrepancies.
+
+function qwenTask(job: Job): string {
+  if (job.mode === "action_extraction") {
+    const filter = jerseyFilterInstruction(job);
+    return `Find EVERY possible instance of this action: "${job.extracted_target}"${filter ? `\n${filter}` : ""}`;
+  }
+  return `Find EVERY possible positive basketball play involving ${compilationSubject(job)}.`;
+}
+
+export function buildQwenProposerPrompt(job: Job, chunkDurationSec: number): string {
+  const dur = chunkDurationSec.toFixed(1);
+
+  return `You are a meticulous professional basketball video analyst reviewing REAL game footage.
+This is a recording of an actual basketball game — not a highlight reel, not an animation, not a simulation.
+
+You are the PROPOSER in a two-stage system. A second, stricter model will VERIFY every clip you
+propose and discard the wrong ones. Therefore your job is RECALL, not precision:
+- Propose ANY moment that could POSSIBLY match — even if you are only 30% sure.
+- It is far better to propose a borderline clip (the verifier will reject it) than to miss a real one.
+- Do NOT self-censor. Do NOT require certainty. When in doubt, INCLUDE it.
+
+TASK: ${qwenTask(job)}
+
+HOW TO THINK (reason step by step BEFORE answering):
+1. Scan the clip second by second for the on-court action.
+2. For each candidate moment, narrate the visual sequence: ball/player movement, the decisive
+   instant (shot release, contact, ball through net, possession change), and the resolution.
+3. Decide the precise start and end seconds for cutting.
+4. Only AFTER reasoning, output the final JSON array.
+
+TIMESTAMP RULES — READ CAREFULLY:
+- Timestamps are floating-point SECONDS measured from the START of THIS clip (which begins at 0.0).
+- This clip is exactly ${dur} seconds long. Every start_sec and end_sec MUST be between 0.0 and ${dur}.
+- Do NOT use mm:ss. Do NOT output frame numbers. Use plain decimal seconds (e.g. 7.5).
+- start_sec: the moment the play begins to develop (the drive, the gather, the jump, the defensive close-out).
+- end_sec: the moment the play fully resolves (ball through net, ball secured, player lands, whistle).
+- end_sec MUST be greater than start_sec.
+
+OUTPUT CONTRACT — THIS IS MANDATORY:
+- Do your reasoning first, in plain text.
+- Then, as the VERY LAST thing in your response, output ONLY a single JSON array.
+- After the closing ] of the JSON array, output NOTHING else — no commentary, no markdown fences.
+- If you find no candidates at all, the final output must be exactly: []
+
+JSON array schema (one object per proposed clip):
+[
+  {
+    "title": "short action name, e.g. 'Dunk' or 'Block'",
+    "description": "1 sentence of what you observe",
+    "start_sec": <float, 0.0 to ${dur}>,
+    "end_sec": <float, start_sec to ${dur}>,
+    "confidence": <float 0.0-1.0, your honest recall estimate — low is fine, include it anyway>,
+    "rank": <integer, 1 = most confident/impactful>,
+    "jerseyNumber": "<clearly legible number string, or null>",
+    "jerseyColor": "<clearly identifiable color string, or null>"
+  }
+]
+
+Remember: propose generously. The verifier will handle precision. Output the JSON array LAST.`;
+}
+
+// ── Gemini verifier prompt ───────────────────────────────────────────────────
+// Stage 2. Strict binary confirm/reject for one small candidate clip.
+
+function verifierSubject(job: Job): string {
+  if (job.mode === "action_extraction") {
+    const action = `a "${job.extracted_target}"`;
+    if (job.jersey_number && job.jersey_color) {
+      return `${action} performed by the player wearing jersey #${job.jersey_number} on the ${job.jersey_color} team`;
+    }
+    if (job.jersey_number) return `${action} performed by the player wearing jersey #${job.jersey_number}`;
+    if (job.jersey_color) return `${action} performed by a player on the ${job.jersey_color} team`;
+    return action;
+  }
+  return `a positive basketball play by ${compilationSubject(job)}`;
+}
+
+export function buildGeminiVerifierPrompt(
+  job: Job,
+  clipDurationSec: number,
+  minConfidence: number,
+): string {
+  const subject = verifierSubject(job);
+
+  return `You are a professional basketball video analyst reviewing real game footage.
+This is a recording of an actual basketball game — not a highlight reel, not animation.
+
+You are the VERIFIER in a two-stage system: a first model proposed this clip as a candidate,
+and your only job is to CONFIRM or REJECT it. You do not find new plays or suggest timestamps.
+
+ABOUT THIS CLIP:
+- It is roughly ${clipDurationSec.toFixed(1)} seconds of real gameplay at normal speed.
+- The candidate action occurs in the MIDDLE of the clip. The first ~2.5 seconds and last
+  ~2.5 seconds are surrounding context (build-up and aftermath) — judge the main action, not the padding.
+
+THE CANDIDATE WAS PROPOSED AS:
+${subject}
+
+CONFIRMATION RULES — be strict:
+- confirmed=true ONLY if the action is clearly and unmistakably present AND completed successfully
+  (a made 3-pointer requires the ball through the net; a block requires the shot to be stopped;
+  a dunk requires the ball thrown down through the rim; a steal requires possession actually changing).
+- If the play is only attempted, missed, or merely similar to the target, set confirmed=false.
+- If a specific jersey number or color was requested, that exact player must perform the action.
+  If the number is not clearly legible or it is a different player, set confirmed=false. Never guess a number.
+- If the footage is too unclear or you genuinely cannot tell, set confirmed=false.
+- A clip you confirm must have confidence of at least ${minConfidence.toFixed(2)}.
+
+Return a JSON object only — no markdown, no explanation, no wrapper text:
+{
+  "confirmed": true | false,
+  "confidence": <float 0.0-1.0>,
+  "reason": "one sentence describing exactly what you observe in the main action"
+}`;
+}

@@ -7,6 +7,8 @@ export type JobStatus =
   | "pending"
   | "extracting_target"
   | "analyzing"
+  | "proposing"
+  | "verifying"
   | "extracting_clips"
   | "stitching"
   | "done"
@@ -80,4 +82,15 @@ export interface PreStepResult {
   teamName: string | null;
   includeAudio: boolean;
   supported: boolean;
+}
+
+// A candidate clip proposed by the Qwen proposer. Structurally a GeminiClipResult
+// (so it can flow through the same merge/dedup/cut helpers), with chunk-relative
+// timestamps until the backend offsets them to absolute video time.
+export type QwenClipProposal = GeminiClipResult;
+
+export interface VerifyResult {
+  confirmed: boolean;
+  confidence: number;
+  reason: string;
 }
