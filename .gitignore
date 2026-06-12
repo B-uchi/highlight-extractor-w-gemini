@@ -45,3 +45,6 @@ next-env.d.ts
 /tmp
 /storage
 /backend/node_modules
+
+**/venv/**
+**/__pycache__/**
