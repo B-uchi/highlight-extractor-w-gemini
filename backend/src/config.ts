@@ -37,21 +37,25 @@ export const config = {
   // "gemini" (default, baseline) or "proposer_verifier" (Qwen on Modal proposes, Gemini verifies).
   analysisMode: (process.env.ANALYSIS_MODE ?? "gemini") as "gemini" | "proposer_verifier",
 
-  // Qwen3-VL-32B-Thinking proposer on Modal. Token budget per chunk ≈
-  // chunkSec × fps × (maxPixels / 784); must stay under maxModelLen minus ~10K for
-  // prompt + thinking output. Validate against [QWEN-TUNE] logs and retune.
+  // Qwen3-VL-32B-Thinking proposer on Modal.
+  // Measured (from [QWEN-TUNE]): ~42 tok/frame at 147456 px, ~eff fps ≈ requested fps.
+  // Per-chunk prompt ≈ chunkSec × fps × 42 + ~2K text.
+  //   60s × 8fps × 42 ≈ 22K (~54% of maxModelLen) — intentionally moderate so that
+  //   `batchSize` chunks fit in KV together and the GPU runs them concurrently (vLLM
+  //   continuous batching). We fill the GPU via batching, not via per-chunk size.
   qwen: {
     appName: process.env.QWEN_MODAL_APP ?? "video-highlight-proposer",
     functionName: process.env.QWEN_MODAL_FUNCTION ?? "propose_clips",
-    fps: Number(process.env.QWEN_FPS ?? 6),
-    // Measured: ~70 tok/frame at 147456 px (not 188). 48s × ~7.5 eff-fps × ~75 ≈ 28K
-    // prompt tokens — well under maxModelLen. Bigger chunks ≈ halve Modal calls/cost.
-    maxPixels: Number(process.env.QWEN_MAX_PIXELS ?? 147_456), // ≈512×288 → ~70 tok/frame
-    chunkSec: Number(process.env.QWEN_CHUNK_SEC ?? 48),
+    fps: Number(process.env.QWEN_FPS ?? 8),               // dense enough for fast action
+    maxPixels: Number(process.env.QWEN_MAX_PIXELS ?? 147_456),
+    chunkSec: Number(process.env.QWEN_CHUNK_SEC ?? 60),   // ~1 min: recall-safe + batch-friendly
     maxModelLen: Number(process.env.QWEN_MAX_MODEL_LEN ?? 40_960),
-    // Each concurrent call lets Modal autoscale another warm A100. Total GPU-compute is
-    // conserved — this just spreads chunks across more GPUs instead of queueing them.
-    proposalParallelism: Number(process.env.QWEN_PROPOSAL_PARALLELISM ?? 6),
+    // Chunks processed CONCURRENTLY in one Modal call via vLLM continuous batching.
+    // 4 × ~22K ≈ 88K tokens of KV — fits the ~200K KV budget on an 80GB A100 (FP8).
+    batchSize: Number(process.env.QWEN_BATCH_SIZE ?? 4),
+    // Concurrent Modal CALLS = warm A100s. With batching, 1–2 saturates the GPU,
+    // so keep this small (each container is billed for the whole job).
+    proposalParallelism: Number(process.env.QWEN_PROPOSAL_PARALLELISM ?? 2),
   },
 
   // Gemini verifier — confirms each small candidate clip inline (no Files API, no slowdown).

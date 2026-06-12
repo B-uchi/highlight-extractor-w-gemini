@@ -48,32 +48,14 @@ async function callRemote(remoteArgs: any[]): Promise<unknown> {
   }
 }
 
-export interface ProposeArgs {
+export interface ProposeItem {
   chunkUrl: string;        // R2 presigned URL — Modal downloads the chunk directly
   chunkSec: number;        // real duration of this chunk
-  job: Job;
 }
 
-/**
- * Call the Qwen proposer on Modal for one chunk. Returns proposals with
- * timestamps RELATIVE to the chunk (0-based); the caller offsets to absolute time.
- */
-export async function proposeClipsForChunk(args: ProposeArgs): Promise<QwenClipProposal[]> {
-  const { chunkUrl, chunkSec, job } = args;
-  const prompt = buildQwenProposerPrompt(job, chunkSec);
-
-  // Python signature: propose_clips(video_url, chunk_sec, fps, max_pixels, max_model_len, prompt_text)
-  const result = await callRemote([
-    chunkUrl,
-    chunkSec,
-    config.qwen.fps,
-    config.qwen.maxPixels,
-    config.qwen.maxModelLen,
-    prompt,
-  ]);
-
-  if (!Array.isArray(result)) return [];
-  return (result as QwenClipProposal[]).filter(
+function sanitize(list: unknown, chunkSec: number): QwenClipProposal[] {
+  if (!Array.isArray(list)) return [];
+  return (list as QwenClipProposal[]).filter(
     (c) =>
       typeof c.start_sec === "number" &&
       typeof c.end_sec === "number" &&
@@ -81,4 +63,33 @@ export async function proposeClipsForChunk(args: ProposeArgs): Promise<QwenClipP
       c.start_sec >= 0 &&
       c.end_sec <= chunkSec + 2, // small tolerance for model drift
   );
+}
+
+/**
+ * Propose clips for a BATCH of chunks in a single Modal call. vLLM continuous-batches
+ * the prompts so one A100 processes them concurrently. Returns one proposal list per
+ * input item (chunk-relative timestamps; the caller offsets to absolute time).
+ */
+export async function proposeClipsBatch(
+  job: Job,
+  items: ProposeItem[],
+): Promise<QwenClipProposal[][]> {
+  if (items.length === 0) return [];
+
+  const remoteItems = items.map((it) => ({
+    video_url: it.chunkUrl,
+    chunk_sec: it.chunkSec,
+    prompt: buildQwenProposerPrompt(job, it.chunkSec),
+  }));
+
+  // Python signature: propose_clips(items, fps, max_pixels, max_model_len) -> list[list]
+  const result = await callRemote([
+    remoteItems,
+    config.qwen.fps,
+    config.qwen.maxPixels,
+    config.qwen.maxModelLen,
+  ]);
+
+  if (!Array.isArray(result)) return items.map(() => []);
+  return items.map((it, i) => sanitize((result as unknown[])[i], it.chunkSec));
 }

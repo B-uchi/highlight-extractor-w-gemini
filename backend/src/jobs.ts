@@ -6,7 +6,7 @@ import { db } from "./db";
 import { downloadFromR2, uploadFileToR2, getPresignedUrl, safeUnlink, objectExists } from "./storage";
 import { cutClip, stitchClips, extractSegment } from "./ffmpeg";
 import { analyzeChunk, ensureChunksReady, extractTarget, verifyClip, retryDelayMs, estimateChunkTokens, isBillingQuotaError, isStorageQuotaError } from "./gemini";
-import { proposeClipsForChunk } from "./modal";
+import { proposeClipsBatch } from "./modal";
 import { config } from "./config";
 import type { FailedChunk, GeminiClipResult, Job, JobMode } from "./types";
 
@@ -302,6 +302,8 @@ async function finalizeClips(
 }
 
 // ── Proposer-verifier path (Qwen proposes → Gemini verifies) ───────────────────
+type Verdict = { confirmed: boolean; confidence: number; reason: string };
+
 async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): Promise<void> {
   const mode = job.mode;
   const t0 = Date.now();
@@ -316,11 +318,10 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
   }
   const videoSecs = conv.video_duration_secs as number;
 
-  // Download source once — used for chunk extraction AND final clip cutting.
   const sourcePath = path.join(tmpJobDir, "source.mp4");
   await downloadFromR2(conv.r2_video_key as string, sourcePath);
 
-  // ── Stage A: propose (Qwen on Modal) ─────────────────────────────────────────
+  // ── Stage A: propose (resumable via chunk_cache) ─────────────────────────────
   await setJobStatus(jobId, { status: "proposing" });
 
   const chunkSec = config.qwen.chunkSec;
@@ -331,47 +332,90 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
     endSec: Math.min((i + 1) * chunkSec, videoSecs),
   }));
 
-  await setJobStatus(jobId, { chunks_total: chunkCount, chunks_analyzed: 0 });
-
-  const chunkResults: { clips: GeminiClipResult[]; chunkIndex: number; startSec: number }[] = [];
-  let proposed = 0;
+  // Pre-seed proposals already saved by a previous run — these skip Modal entirely.
+  const proposalCache = new Map<number, GeminiClipResult[]>(
+    Object.entries((job.chunk_cache ?? {}) as Record<string, GeminiClipResult[]>)
+      .map(([k, v]) => [Number(k), v]),
+  );
+  const failed: FailedChunk[] = [];
+  let analyzed = proposalCache.size;
   const parallelism = config.qwen.proposalParallelism;
 
-  for (let i = 0; i < chunks.length; i += parallelism) {
+  await setJobStatus(jobId, { chunks_total: chunkCount, chunks_analyzed: analyzed });
+
+  // vLLM batching: group pending chunks into batches; ONE Modal call processes a whole
+  // batch concurrently on the GPU. `parallelism` such batch-calls run across warm A100s.
+  type ChunkInfo = { index: number; startSec: number; endSec: number };
+  const pendingChunks: ChunkInfo[] = chunks.filter((c) => !proposalCache.has(c.index));
+  const batchSize = Math.max(1, config.qwen.batchSize);
+  const groups: ChunkInfo[][] = [];
+  for (let i = 0; i < pendingChunks.length; i += batchSize) {
+    groups.push(pendingChunks.slice(i, i + batchSize));
+  }
+
+  for (let g = 0; g < groups.length; g += parallelism) {
     if (await checkCancelled(jobId)) {
       await setJobMessage(jobId, "Job was cancelled during proposal.");
       await setJobStatus(jobId, { status: "cancelled" });
       return;
     }
-    const batch = chunks.slice(i, i + parallelism);
-    const results = await Promise.all(
-      batch.map(async (chunk) => {
-        const dur = chunk.endSec - chunk.startSec;
-        // Per-video chunk cache: keyed by conversation + chunkSec, reused across prompts.
-        const chunkKey = `qwen-chunks/${job.conversation_id}/${chunkSec}s/${chunk.index}.mp4`;
-        if (!(await objectExists(chunkKey))) {
-          const localChunk = path.join(tmpJobDir, `qchunk_${chunk.index}.mp4`);
-          await extractSegment(sourcePath, chunk.startSec, dur, localChunk);
-          await uploadFileToR2(localChunk, chunkKey);
-          await safeUnlink(localChunk);
+    const concurrent = groups.slice(g, g + parallelism);
+
+    await Promise.all(
+      concurrent.map(async (group) => {
+        try {
+          // Ensure each chunk's R2 object exists (per-video cache), presign, build items.
+          const items = await Promise.all(
+            group.map(async (chunk) => {
+              const dur = chunk.endSec - chunk.startSec;
+              const chunkKey = `qwen-chunks/${job.conversation_id}/${chunkSec}s/${chunk.index}.mp4`;
+              if (!(await objectExists(chunkKey))) {
+                const localChunk = path.join(tmpJobDir, `qchunk_${chunk.index}.mp4`);
+                await extractSegment(sourcePath, chunk.startSec, dur, localChunk);
+                await uploadFileToR2(localChunk, chunkKey);
+                await safeUnlink(localChunk);
+              }
+              const url = await getPresignedUrl(chunkKey, 1800);
+              return { chunkUrl: url, chunkSec: dur };
+            }),
+          );
+          const lists = await proposeClipsBatch(job, items);
+          group.forEach((chunk, idx) => proposalCache.set(chunk.index, lists[idx] ?? []));
+        } catch (err) {
+          // Whole batch failed — record each chunk so a retry resumes just these.
+          const msg = (err as Error)?.message ?? String(err);
+          for (const chunk of group) {
+            failed.push({ chunkIndex: chunk.index, startSec: chunk.startSec, endSec: chunk.endSec, error: msg });
+          }
+          console.warn(`[jobs] propose batch failed (${group.length} chunks): ${msg}`);
+        } finally {
+          analyzed += group.length;
         }
-        const url = await getPresignedUrl(chunkKey, 1800);
-        const proposals = await proposeClipsForChunk({ chunkUrl: url, chunkSec: dur, job });
-        return { proposals, chunk };
       }),
     );
-    for (const { proposals, chunk } of results) {
-      proposed += proposals.length;
-      chunkResults.push({ clips: proposals, chunkIndex: chunk.index, startSec: chunk.startSec });
-    }
-    await setJobStatus(jobId, { chunks_analyzed: Math.min(i + parallelism, chunkCount) });
+
+    // Persist after every wave — a crash/quota past this point never re-runs Modal.
+    await setJobStatus(jobId, {
+      chunks_analyzed: analyzed,
+      chunk_cache: Object.fromEntries(proposalCache),
+      ...(failed.length ? { failed_chunks: failed } : {}),
+    });
   }
 
-  // Offset chunk-relative → absolute (slowdown=1), dedup, order. No clip_limit yet — verify all.
+  if (proposalCache.size === 0) {
+    throw new Error("All chunks failed to propose — nothing to verify. Retry to resume.");
+  }
+
+  // Deterministic candidate list from cached proposals (stable across retries).
+  const chunkResults = chunks
+    .filter((c) => proposalCache.has(c.index))
+    .map((c) => ({ clips: proposalCache.get(c.index)!, chunkIndex: c.index, startSec: c.startSec }));
   const candidates = mergeAndRank(chunkResults, mode, null, 1);
+  const totalProposed = [...proposalCache.values()].reduce((n, v) => n + v.length, 0);
   console.log(
     `[PV-TUNE] mode=${mode} video_secs=${videoSecs} chunk_sec=${chunkSec} chunk_count=${chunkCount} ` +
-    `proposer_parallelism=${parallelism} total_proposals=${proposed} after_dedup=${candidates.length}`,
+    `proposer_parallelism=${parallelism} total_proposals=${totalProposed} after_dedup=${candidates.length} ` +
+    `failed_chunks=${failed.length} modal_wall_secs=${((Date.now() - t0) / 1000).toFixed(1)}`,
   );
 
   if (candidates.length === 0) {
@@ -380,49 +424,81 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
     return;
   }
 
-  // ── Stage B: verify (Gemini inline) ──────────────────────────────────────────
-  await setJobStatus(jobId, { status: "verifying", clips_total: candidates.length, clips_done: 0 });
+  // ── Stage B: verify (resumable via pv_verdicts, partial-safe on quota) ───────
+  await setJobStatus(jobId, { status: "verifying", clips_total: candidates.length });
 
+  // Pre-seed verdicts already saved — these skip Gemini entirely on a retry.
+  const verdicts = new Map<number, Verdict>(
+    Object.entries((job.pv_verdicts ?? {}) as Record<string, Verdict>).map(([k, v]) => [Number(k), v]),
+  );
   const vPar = config.verifier.parallelism;
-  const confirmed: GeminiClipResult[] = [];
-  let verifiedDone = 0;
-  let confirmedCount = 0;
-  let rejectedCount = 0;
   const vStart = Date.now();
+  let verifyStopped = false;       // interrupted (quota / rate limit) — resumable
+  let billingHit = false;
+  await setJobStatus(jobId, { clips_done: verdicts.size });
 
-  for (let i = 0; i < candidates.length; i += vPar) {
+  const toVerify = candidates
+    .map((c, idx) => ({ c, idx }))
+    .filter(({ idx }) => !verdicts.has(idx));
+
+  for (let i = 0; i < toVerify.length && !verifyStopped; i += vPar) {
     if (await checkCancelled(jobId)) {
+      await setJobStatus(jobId, { pv_verdicts: Object.fromEntries(verdicts) });
       await setJobMessage(jobId, "Job was cancelled during verification.");
       await setJobStatus(jobId, { status: "cancelled" });
       return;
     }
-    const batch = candidates.slice(i, i + vPar);
-    const results = await Promise.all(
-      batch.map(async (cand, bi) => {
-        const idx = i + bi;
-        const cutStart = Math.max(0, cand.start_sec - config.verifier.preActionPad);
-        const cutEnd = Math.min(cand.end_sec + config.verifier.postActionPad, videoSecs);
-        if (cutEnd <= cutStart) return null;
+    const batch = toVerify.slice(i, i + vPar);
+    const results = await Promise.allSettled(
+      batch.map(async ({ c, idx }) => {
+        const cutStart = Math.max(0, c.start_sec - config.verifier.preActionPad);
+        const cutEnd = Math.min(c.end_sec + config.verifier.postActionPad, videoSecs);
+        if (cutEnd <= cutStart) {
+          return { idx, verdict: { confirmed: false, confidence: 0, reason: "out of bounds" } as Verdict };
+        }
         const vPath = path.join(tmpJobDir, `verify_${idx}.mp4`);
         await cutClip(sourcePath, cutStart, cutEnd, vPath);
         const res = await verifyClip(vPath, job, cutEnd - cutStart);
         await safeUnlink(vPath);
         console.log(`[PV-VERIFY] idx=${idx} confirmed=${res.confirmed} conf=${res.confidence.toFixed(2)} reason="${res.reason.replace(/"/g, "'")}"`);
-        return res.confirmed ? cand : null;
+        return { idx, verdict: res };
       }),
     );
     for (const r of results) {
-      verifiedDone++;
-      if (r) { confirmed.push(r); confirmedCount++; } else { rejectedCount++; }
+      if (r.status === "fulfilled") {
+        verdicts.set(r.value.idx, r.value.verdict);
+      } else {
+        // verifyClip only throws on quota / exhausted-rate-limit — both resumable.
+        verifyStopped = true;
+        if (isBillingQuotaError(r.reason)) billingHit = true;
+      }
     }
-    await setJobStatus(jobId, { clips_done: verifiedDone });
+    // Persist verdicts every batch — a crash/quota never re-verifies these candidates.
+    await setJobStatus(jobId, { clips_done: verdicts.size, pv_verdicts: Object.fromEntries(verdicts) });
   }
 
+  const confirmed = candidates.filter((_, idx) => verdicts.get(idx)?.confirmed);
+  const unverified = candidates.length - verdicts.size;
+
   console.log(
-    `[PV-TUNE] verified_confirmed=${confirmedCount} verified_rejected=${rejectedCount} ` +
-    `modal_wall_secs=${((vStart - t0) / 1000).toFixed(1)} verify_wall_secs=${((Date.now() - vStart) / 1000).toFixed(1)} ` +
-    `gemini_verify_requests=${candidates.length}`,
+    `[PV-TUNE] verified=${verdicts.size}/${candidates.length} confirmed=${confirmed.length} ` +
+    `unverified=${unverified} stopped=${verifyStopped} verify_wall_secs=${((Date.now() - vStart) / 1000).toFixed(1)}`,
   );
+
+  // Interrupted with work still pending → leave a retryable error. chunk_cache +
+  // pv_verdicts are persisted, so a retry resumes WITHOUT re-running Modal or
+  // re-verifying anything already checked.
+  if (verifyStopped && unverified > 0) {
+    const msg = billingHit
+      ? `Gemini quota exhausted after verifying ${verdicts.size}/${candidates.length} candidate(s) ` +
+        `(${confirmed.length} confirmed so far). Your proposals and verifications are saved — ` +
+        `retry once quota resets to finish the remaining ${unverified} (this will NOT re-run Qwen).`
+      : `Verification was interrupted after ${verdicts.size}/${candidates.length} candidate(s). ` +
+        `Progress is saved — retry to resume the remaining ${unverified}.`;
+    await setJobMessage(jobId, msg);
+    await setJobStatus(jobId, { status: "error", error_message: msg });
+    return;
+  }
 
   if (confirmed.length === 0) {
     await setJobStatus(jobId, { status: "done", clips_total: 0 });
@@ -430,8 +506,8 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
     return;
   }
 
-  // Apply clip_limit + final ordering after verification.
-  let finalClips = confirmed;
+  // All verified → rank, apply clip_limit, finalize.
+  let finalClips = confirmed.slice();
   if (mode === "action_extraction") {
     finalClips.sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
     if (job.clip_limit) finalClips = finalClips.slice(0, job.clip_limit);
@@ -440,7 +516,11 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
   }
   finalClips = finalClips.map((c, i) => ({ ...c, rank: i + 1 }));
 
-  await finalizeClips(jobId, job, mode, finalClips, sourcePath, tmpJobDir, "");
+  const note = failed.length > 0
+    ? `\n\nNote: ${failed.length} chunk(s) failed to propose — ${formatTimeRange(failed)} of the video was skipped.`
+    : "";
+
+  await finalizeClips(jobId, job, mode, finalClips, sourcePath, tmpJobDir, note);
 }
 
 export async function processJob(jobId: string): Promise<void> {

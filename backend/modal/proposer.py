@@ -3,7 +3,8 @@ Qwen3-VL-32B-Thinking proposer on Modal, served with vLLM (FP8).
 
 Deploy:  modal deploy backend/modal/proposer.py
 App:     video-highlight-proposer
-Fn:      propose_clips(video_url, chunk_sec, fps, max_pixels, max_model_len, prompt_text) -> list[dict]
+Fn:      propose_clips(items, fps, max_pixels, max_model_len) -> list[list]
+         items: [{"video_url", "chunk_sec", "prompt"}, ...] — batched via vLLM continuous batching
 
 Notes
 - FP8 checkpoint (~33 GB) fits A100-80GB with large KV headroom for video context.
@@ -136,110 +137,125 @@ def _validate(clips: list, chunk_sec: float) -> list:
     volumes={CACHE_DIR: cache_vol},
     secrets=[hf_secret],
     timeout=900,
-    scaledown_window=300,  # keep the container warm 5 min between calls (weights stay loaded)
+    # Idle warm containers are billed. Keep just enough warmth to span a job's chunks
+    # without paying for a long idle tail after it finishes.
+    scaledown_window=90,
 )
 def propose_clips(
-    video_url: str,
-    chunk_sec: float,
+    items: list,
     fps: float,
     max_pixels: int,
     max_model_len: int,
-    prompt_text: str,
 ) -> list:
-    """Download a chunk, run Qwen3-VL-Thinking, return chunk-relative clip proposals."""
+    """
+    Process a BATCH of chunks in one call. `items` is a list of
+    {"video_url", "chunk_sec", "prompt"}. All chunks are fed to a single
+    llm.generate() so vLLM continuous-batches them on the GPU concurrently.
+    Returns one proposal list per input item (aligned by index).
+    """
     cold = _llm is None
     t_load0 = time.time()
     llm, processor = _load(max_model_len)
     load_secs = time.time() - t_load0 if cold else 0.0
 
-    video_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-            video_path = f.name
-            with requests.get(video_url, stream=True, timeout=120) as r:
-                r.raise_for_status()
-                for piece in r.iter_content(chunk_size=1 << 20):
-                    f.write(piece)
+    patch_size = getattr(getattr(processor, "image_processor", None), "patch_size", 16)
+    # Thinking model burns output tokens on reasoning before the JSON answer.
+    sampling = SamplingParams(temperature=0.0, max_tokens=16384, repetition_penalty=1.05)
 
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "video", "video": video_path, "fps": fps, "max_pixels": max_pixels},
-                {"type": "text", "text": prompt_text},
-            ],
-        }]
-
-        prompt = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
-        )
-
-        # vLLM 0.11's Qwen3-VL parser unpacks each video item as `(array, metadata)`,
-        # so process_vision_info must return metadata-bearing tuples. The newer
-        # qwen-vl-utils takes return_video_metadata + image_patch_size; fall back for older.
-        patch_size = getattr(getattr(processor, "image_processor", None), "patch_size", 16)
+    def _frame_count(v):
+        arr = v[0] if isinstance(v, (tuple, list)) else v
         try:
-            _, video_inputs, video_kwargs = process_vision_info(
-                messages,
-                image_patch_size=patch_size,
-                return_video_kwargs=True,
-                return_video_metadata=True,
-            )
-        except TypeError:
-            # Older qwen-vl-utils without the metadata kwargs.
-            _, video_inputs, video_kwargs = process_vision_info(
-                messages, return_video_kwargs=True,
-            )
+            return int(arr.shape[0])
+        except Exception:
+            return 0
 
-        # Each item may be a (video_array, metadata) tuple (Qwen3-VL) or a bare array.
-        def _frame_count(v):
-            arr = v[0] if isinstance(v, (tuple, list)) else v
+    results = [[] for _ in items]
+    video_paths = []
+    gen_inputs = []
+    frame_counts = []
+    valid_idx = []  # item indices that built successfully
+
+    try:
+        for i, it in enumerate(items):
             try:
-                return int(arr.shape[0])
-            except Exception:
-                return 0
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                    vp = f.name
+                    with requests.get(it["video_url"], stream=True, timeout=120) as r:
+                        r.raise_for_status()
+                        for piece in r.iter_content(chunk_size=1 << 20):
+                            f.write(piece)
+                video_paths.append(vp)
 
-        frames = _frame_count(video_inputs[0]) if video_inputs else 0
+                messages = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "video", "video": vp, "fps": fps, "max_pixels": max_pixels},
+                        {"type": "text", "text": it["prompt"]},
+                    ],
+                }]
+                prompt = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
+                # vLLM 0.11's Qwen3-VL parser unpacks each video item as (array, metadata).
+                try:
+                    _, video_inputs, video_kwargs = process_vision_info(
+                        messages, image_patch_size=patch_size,
+                        return_video_kwargs=True, return_video_metadata=True,
+                    )
+                except TypeError:
+                    _, video_inputs, video_kwargs = process_vision_info(
+                        messages, return_video_kwargs=True,
+                    )
 
-        # Thinking model burns output tokens on reasoning before the JSON answer —
-        # give generous headroom so the final array isn't truncated (→ silent []).
-        sampling = SamplingParams(temperature=0.0, max_tokens=16384, repetition_penalty=1.05)
+                frame_counts.append(_frame_count(video_inputs[0]) if video_inputs else 0)
+                gen_inputs.append({
+                    "prompt": prompt,
+                    "multi_modal_data": {"video": video_inputs},
+                    "mm_processor_kwargs": video_kwargs,
+                })
+                valid_idx.append(i)
+            except Exception as exc:
+                print(f"[proposer] item {i} prep failed: {exc}")
+
+        if not gen_inputs:
+            return results
+
         t_inf0 = time.time()
-        # Pass video_inputs through as-is (tuples carry the metadata vLLM requires).
-        outputs = llm.generate(
-            [{
-                "prompt": prompt,
-                "multi_modal_data": {"video": video_inputs},
-                "mm_processor_kwargs": video_kwargs,
-            }],
-            sampling,
-        )
+        outputs = llm.generate(gen_inputs, sampling)  # ← vLLM continuous batching
         infer_secs = time.time() - t_inf0
 
-        out = outputs[0]
-        prompt_tokens = len(out.prompt_token_ids)
-        output_tokens = len(out.outputs[0].token_ids)
-        text = out.outputs[0].text
+        for k, out in enumerate(outputs):
+            i = valid_idx[k]
+            chunk_sec = float(items[i]["chunk_sec"])
+            prompt_tokens = len(out.prompt_token_ids)
+            output_tokens = len(out.outputs[0].token_ids)
+            clips = _validate(_extract_json_array(out.outputs[0].text), chunk_sec)
+            results[i] = clips
 
-        clips = _validate(_extract_json_array(text), chunk_sec)
+            frames = frame_counts[k]
+            tpf = round(prompt_tokens / frames, 1) if frames else 0
+            budget_pct = round(100.0 * prompt_tokens / max_model_len, 1)
+            print(
+                f"[QWEN-TUNE] batch_size={len(gen_inputs)} chunk_sec={chunk_sec:.1f} fps={fps} "
+                f"max_pixels={max_pixels} frames_sampled={frames} prompt_tokens={prompt_tokens} "
+                f"tokens_per_frame={tpf} budget_pct={budget_pct} max_model_len={max_model_len} "
+                f"output_tokens={output_tokens} proposals_returned={len(clips)}"
+            )
+            if prompt_tokens > 0.9 * max_model_len:
+                print(f"[QWEN-TUNE] WARN prompt_tokens={prompt_tokens} > 90% of max_model_len={max_model_len}")
 
-        tpf = round(prompt_tokens / frames, 1) if frames else 0
-        headroom = max_model_len - prompt_tokens
+        per_chunk = infer_secs / max(1, len(gen_inputs))
         print(
-            f"[QWEN-TUNE] chunk_sec={chunk_sec:.1f} fps={fps} max_pixels={max_pixels} "
-            f"frames_sampled={frames} prompt_tokens={prompt_tokens} tokens_per_frame={tpf} "
-            f"max_model_len={max_model_len} headroom_tokens={headroom} "
-            f"output_tokens={output_tokens} proposals_returned={len(clips)} "
-            f"load_secs={load_secs:.1f} infer_secs={infer_secs:.1f}"
+            f"[QWEN-TUNE] BATCH_DONE items={len(items)} processed={len(gen_inputs)} "
+            f"batch_infer_secs={infer_secs:.1f} per_chunk_secs={per_chunk:.1f} load_secs={load_secs:.1f}"
         )
-        if prompt_tokens > 0.9 * max_model_len:
-            print(f"[QWEN-TUNE] WARN prompt_tokens={prompt_tokens} exceeds 90% of max_model_len={max_model_len} — reduce chunk_sec/fps/max_pixels")
-
-        return clips
+        return results
     except Exception as exc:
         import traceback
-        print(f"[proposer] error: {exc}")
+        print(f"[proposer] batch error: {exc}")
         traceback.print_exc()
-        return []
+        return results
     finally:
-        if video_path and os.path.exists(video_path):
-            os.unlink(video_path)
+        for vp in video_paths:
+            if vp and os.path.exists(vp):
+                os.unlink(vp)
