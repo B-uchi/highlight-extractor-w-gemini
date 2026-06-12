@@ -61,7 +61,9 @@ export async function getVideoDuration(filePath: string): Promise<number> {
   });
 }
 
-/** Extract a time-range from a video using stream copy (no re-encode). Fast, approx keyframe cuts. */
+/** Extract a time-range via stream copy (no re-encode). Fast, but snaps to keyframes —
+ *  the actual start can be up to one GOP (~10s) EARLIER than requested. Only safe when the
+ *  exact start time does not matter (e.g. Gemini chunks whose timestamps are self-contained). */
 export async function extractSegment(
   inputPath: string,
   startSec: number,
@@ -74,6 +76,30 @@ export async function extractSegment(
     "-i", inputPath,
     "-t", String(durationSec),
     "-c", "copy",
+    outputPath,
+  ]);
+}
+
+/** Frame-accurate segment extract (re-encode, audio stripped). The output's frame 0 is EXACTLY
+ *  `startSec` of the input — critical for the Qwen proposer, whose chunk-relative timestamps are
+ *  mapped to absolute time as `chunkStart + relative`. Uses the 2s pre-seek buffer trick: input-seek
+ *  to a keyframe just before, then output-seek the buffer so decoding lands precisely on startSec. */
+export async function extractSegmentAccurate(
+  inputPath: string,
+  startSec: number,
+  durationSec: number,
+  outputPath: string,
+): Promise<void> {
+  const preBuf = Math.min(2, startSec);
+  const seekTo = startSec - preBuf;
+  await run([
+    "-y",
+    "-ss", String(seekTo),
+    "-i", inputPath,
+    "-ss", String(preBuf),
+    "-t", String(durationSec),
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "25",
+    "-an",
     outputPath,
   ]);
 }

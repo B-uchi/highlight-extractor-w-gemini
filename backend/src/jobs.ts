@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 
 import { db } from "./db";
 import { downloadFromR2, uploadFileToR2, getPresignedUrl, safeUnlink, objectExists } from "./storage";
-import { cutClip, stitchClips, extractSegment } from "./ffmpeg";
+import { cutClip, stitchClips, extractSegmentAccurate } from "./ffmpeg";
 import { analyzeChunk, ensureChunksReady, extractTarget, verifyClip, retryDelayMs, estimateChunkTokens, isBillingQuotaError, isHardBillingError, isStorageQuotaError } from "./gemini";
 import { proposeClipsBatch } from "./modal";
 import { config } from "./config";
@@ -230,6 +230,13 @@ async function finalizeClips(
           idx,
           mode !== "action_extraction",
         );
+        // Audit: candidate_t is the SAME absolute time the verifier checked (cross-reference
+        // against [PV-VERIFY] t=). cut is the padded window actually written to the file.
+        console.log(
+          `[PV-FINAL] rank=${clip.rank} candidate_t=${clip.start_sec.toFixed(1)}-${clip.end_sec.toFixed(1)}s ` +
+          `cut=${uploaded.start_sec.toFixed(1)}-${uploaded.end_sec.toFixed(1)}s ` +
+          `title="${(clip.title ?? "").replace(/"/g, "'")}" key=${uploaded.r2_clip_key}`,
+        );
         clipRows.push({
           id: uploaded.id,
           job_id: jobId,
@@ -364,10 +371,12 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
       const items = await Promise.all(
         group.map(async (chunk) => {
           const dur = chunk.endSec - chunk.startSec;
-          const chunkKey = `qwen-chunks/${job.conversation_id}/${chunkSec}s/${chunk.index}.mp4`;
+          // "-acc" marks frame-accurate chunks; it also invalidates any previously cached
+          // stream-copy (keyframe-drifted) chunks for this video so they are re-extracted.
+          const chunkKey = `qwen-chunks/${job.conversation_id}/${chunkSec}s-acc/${chunk.index}.mp4`;
           if (!(await objectExists(chunkKey))) {
             const localChunk = path.join(tmpJobDir, `qchunk_${chunk.index}.mp4`);
-            await extractSegment(sourcePath, chunk.startSec, dur, localChunk);
+            await extractSegmentAccurate(sourcePath, chunk.startSec, dur, localChunk);
             await uploadFileToR2(localChunk, chunkKey);
             await safeUnlink(localChunk);
           }
@@ -472,7 +481,14 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
         try {
           await cutClip(sourcePath, cutStart, cutEnd, vPath);
           const res = await verifyClip(vPath, job, cutEnd - cutStart);
-          console.log(`[PV-VERIFY] idx=${idx} confirmed=${res.confirmed} conf=${res.confidence.toFixed(2)} reason="${res.reason.replace(/"/g, "'")}"`);
+          // Audit line: Qwen's intended play+time vs what the verifier actually sees at that
+          // cut. If qwen="…" and reason="…" describe different plays, the timestamp is drifting.
+          const qwenTitle = (c.title ?? "").replace(/"/g, "'");
+          console.log(
+            `[PV-VERIFY] idx=${idx} t=${c.start_sec.toFixed(1)}-${c.end_sec.toFixed(1)}s ` +
+            `qwen="${qwenTitle}" confirmed=${res.confirmed} conf=${res.confidence.toFixed(2)} ` +
+            `reason="${res.reason.replace(/"/g, "'")}"`,
+          );
           return { idx, verdict: res };
         } catch (err) {
           // verifyClip only throws on TRUE hard billing — propagate that to stop the job
