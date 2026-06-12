@@ -368,22 +368,24 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
   const processGroup = async (group: ChunkInfo[]) => {
     try {
       // Ensure each chunk's R2 object exists (per-video cache), presign, build items.
-      const items = await Promise.all(
-        group.map(async (chunk) => {
-          const dur = chunk.endSec - chunk.startSec;
-          // "-acc" marks frame-accurate chunks; it also invalidates any previously cached
-          // stream-copy (keyframe-drifted) chunks for this video so they are re-extracted.
-          const chunkKey = `qwen-chunks/${job.conversation_id}/${chunkSec}s-acc/${chunk.index}.mp4`;
-          if (!(await objectExists(chunkKey))) {
-            const localChunk = path.join(tmpJobDir, `qchunk_${chunk.index}.mp4`);
-            await extractSegmentAccurate(sourcePath, chunk.startSec, dur, localChunk);
-            await uploadFileToR2(localChunk, chunkKey);
-            await safeUnlink(localChunk);
-          }
-          const url = await getPresignedUrl(chunkKey, 1800);
-          return { chunkUrl: url, chunkSec: dur };
-        }),
-      );
+      // Extraction is SEQUENTIAL within a batch: each chunk is a full 60s re-encode, and
+      // running all `batchSize` at once (× parallelism workers) exhausts the container's
+      // memory and x264 fails to open. Sequential here → at most `parallelism` encodes total.
+      const items: { chunkUrl: string; chunkSec: number }[] = [];
+      for (const chunk of group) {
+        const dur = chunk.endSec - chunk.startSec;
+        // "-acc" marks frame-accurate chunks; it also invalidates any previously cached
+        // stream-copy (keyframe-drifted) chunks for this video so they are re-extracted.
+        const chunkKey = `qwen-chunks/${job.conversation_id}/${chunkSec}s-acc/${chunk.index}.mp4`;
+        if (!(await objectExists(chunkKey))) {
+          const localChunk = path.join(tmpJobDir, `qchunk_${chunk.index}.mp4`);
+          await extractSegmentAccurate(sourcePath, chunk.startSec, dur, localChunk);
+          await uploadFileToR2(localChunk, chunkKey);
+          await safeUnlink(localChunk);
+        }
+        const url = await getPresignedUrl(chunkKey, 1800);
+        items.push({ chunkUrl: url, chunkSec: dur });
+      }
       const lists = await proposeClipsBatch(job, items);
       group.forEach((chunk, idx) => proposalCache.set(chunk.index, lists[idx] ?? []));
     } catch (err) {

@@ -98,7 +98,11 @@ export async function extractSegmentAccurate(
     "-i", inputPath,
     "-ss", String(preBuf),
     "-t", String(durationSec),
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", "25",
+    // ultrafast + capped threads keeps per-encode memory low so several can run on a
+    // small backend container without x264 failing to allocate its buffers. Preset does
+    // NOT affect seek accuracy (that comes from the -ss positioning); only speed/size.
+    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "25",
+    "-threads", "2",
     "-an",
     outputPath,
   ]);
