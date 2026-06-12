@@ -21,6 +21,33 @@ async function getProposerFn() {
   return _fn;
 }
 
+// A cached function handle goes stale when the Modal app is stopped/redeployed
+// (the old function ID no longer exists). Detect that and force a fresh lookup.
+function isStaleFunctionError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes("failed_precondition") ||
+    msg.includes("is stopped") ||
+    msg.includes("not_found") ||
+    msg.includes("does not exist")
+  );
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function callRemote(remoteArgs: any[]): Promise<unknown> {
+  let fn = await getProposerFn();
+  try {
+    return await fn.remote(remoteArgs);
+  } catch (err) {
+    if (!isStaleFunctionError(err)) throw err;
+    // Stale handle — drop the cache, re-resolve the live function, retry once.
+    console.warn("[modal] stale function handle — re-resolving and retrying");
+    _fn = null;
+    fn = await getProposerFn();
+    return await fn.remote(remoteArgs);
+  }
+}
+
 export interface ProposeArgs {
   chunkUrl: string;        // R2 presigned URL — Modal downloads the chunk directly
   chunkSec: number;        // real duration of this chunk
@@ -35,9 +62,8 @@ export async function proposeClipsForChunk(args: ProposeArgs): Promise<QwenClipP
   const { chunkUrl, chunkSec, job } = args;
   const prompt = buildQwenProposerPrompt(job, chunkSec);
 
-  const fn = await getProposerFn();
   // Python signature: propose_clips(video_url, chunk_sec, fps, max_pixels, max_model_len, prompt_text)
-  const result = await fn.remote([
+  const result = await callRemote([
     chunkUrl,
     chunkSec,
     config.qwen.fps,

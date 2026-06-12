@@ -45,6 +45,10 @@ image = (
     .env({
         "HF_HOME": f"{CACHE_DIR}/hf",
         "VLLM_CACHE_ROOT": f"{CACHE_DIR}/vllm",  # reuse compiled graphs across cold starts
+        # debian_slim has the CUDA runtime but NOT the toolkit (no nvcc). FlashInfer's
+        # sampler tries to JIT-build a CUDA kernel at startup and fails. We decode greedily
+        # (temperature=0), so vLLM's native PyTorch sampler is equivalent and needs no build.
+        "VLLM_USE_FLASHINFER_SAMPLER": "0",
     })
 )
 
