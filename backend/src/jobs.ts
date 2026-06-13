@@ -433,12 +433,28 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
   const chunkResults = chunks
     .filter((c) => proposalCache.has(c.index))
     .map((c) => ({ clips: proposalCache.get(c.index)!, chunkIndex: c.index, startSec: c.startSec }));
-  const candidates = mergeAndRank(chunkResults, mode, null, 1);
+  const rawCandidates = mergeAndRank(chunkResults, mode, null, 1);
+
+  // Collapse overlapping proposals BEFORE verifying — Qwen's liberal/gridded candidates
+  // produce many whose padded clips cover the same moment. We only pay Gemini for distinct
+  // moments. Keep the highest-confidence one in each overlapping run.
+  const mergeGap = PRE_ACTION_PAD + POST_ACTION_PAD;
+  const candidates: GeminiClipResult[] = [];
+  for (const c of [...rawCandidates].sort((a, b) => a.start_sec - b.start_sec)) {
+    const last = candidates[candidates.length - 1];
+    if (last && c.start_sec - last.start_sec < mergeGap) {
+      if ((c.confidence ?? 0) > (last.confidence ?? 0)) candidates[candidates.length - 1] = c;
+    } else {
+      candidates.push(c);
+    }
+  }
+
   const totalProposed = [...proposalCache.values()].reduce((n, v) => n + v.length, 0);
   console.log(
     `[PV-TUNE] mode=${mode} video_secs=${videoSecs} chunk_sec=${chunkSec} chunk_count=${chunkCount} ` +
-    `proposer_parallelism=${parallelism} total_proposals=${totalProposed} after_dedup=${candidates.length} ` +
-    `failed_chunks=${failed.length} modal_wall_secs=${((Date.now() - t0) / 1000).toFixed(1)}`,
+    `proposer_parallelism=${parallelism} total_proposals=${totalProposed} after_merge=${rawCandidates.length} ` +
+    `verify_candidates=${candidates.length} failed_chunks=${failed.length} ` +
+    `modal_wall_secs=${((Date.now() - t0) / 1000).toFixed(1)}`,
   );
 
   if (candidates.length === 0) {
@@ -516,6 +532,7 @@ async function runProposerVerifier(jobId: string, job: Job, tmpJobDir: string): 
     await setJobStatus(jobId, { clips_done: verdicts.size, pv_verdicts: Object.fromEntries(verdicts) });
   }
 
+  // Candidates were already overlap-deduped before verify, so a simple filter here.
   const confirmed = candidates.filter((_, idx) => verdicts.get(idx)?.confirmed);
   const unverified = candidates.length - verdicts.size;
 

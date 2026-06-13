@@ -48,7 +48,11 @@ export const config = {
     functionName: process.env.QWEN_MODAL_FUNCTION ?? "propose_clips",
     fps: Number(process.env.QWEN_FPS ?? 8),               // dense enough for fast action
     maxPixels: Number(process.env.QWEN_MAX_PIXELS ?? 147_456),
-    chunkSec: Number(process.env.QWEN_CHUNK_SEC ?? 60),   // ~1 min: recall-safe + batch-friendly
+    // 30s, not 60s: on a 60s window Qwen stops localizing and emits a regular GRID of
+    // timestamps (every 2–5s). A shorter window forces it to pin actual plays, sharpening
+    // timestamps and cutting duplicates. Plenty of token headroom (~11K/chunk) and batching
+    // absorbs the extra chunk count. Drop to 20 if gridding persists.
+    chunkSec: Number(process.env.QWEN_CHUNK_SEC ?? 30),
     maxModelLen: Number(process.env.QWEN_MAX_MODEL_LEN ?? 40_960),
     // Chunks processed CONCURRENTLY in one Modal call via vLLM continuous batching.
     // Measured KV cache = 144K tokens; each chunk ~14K (budget_pct ~35%) → ~10 fit.
@@ -61,11 +65,11 @@ export const config = {
 
   // Gemini verifier — confirms each small candidate clip inline (no Files API, no slowdown).
   verifier: {
-    // GA model by default. gemini-3.1-pro-preview uses a *shared* preview quota and throws
-    // 429/RESOURCE_EXHAUSTED from global congestion even at near-zero personal usage (the
-    // "ghost 429" — paid keys can be stuck on Free-Tier limits for 3.x for 24–48h). A GA
-    // model has real provisioned quota. Set VERIFY_MODEL=gemini-3.1-pro-preview to opt back in.
-    model: process.env.VERIFY_MODEL ?? "gemini-2.5-pro",
+    // Flash by default — confirming "is this a made shot?" on a 5s clip is an easy task that
+    // Flash handles well at ~4x lower cost than 2.5-pro and ~12x lower than 3.1-pro-preview.
+    // Bump to gemini-2.5-pro if you measure too many false confirms; flash-lite is even cheaper.
+    // (Avoid gemini-3.1-pro-preview: shared preview quota / ghost-429 — see git history.)
+    model: process.env.VERIFY_MODEL ?? "gemini-2.5-flash",
     fps: Number(process.env.VERIFY_FPS ?? 6),
     parallelism: Number(process.env.VERIFY_PARALLELISM ?? 4),
     minConfidence: Number(process.env.VERIFY_MIN_CONFIDENCE ?? 0.6),
