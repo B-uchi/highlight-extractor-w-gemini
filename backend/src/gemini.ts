@@ -323,7 +323,7 @@ export async function analyzeChunk(
   for (let attempt = 1; attempt <= MAX_ANALYZE_RETRIES; attempt++) {
     try {
       const response = await ai.models.generateContent({
-        model: "gemini-2.5-pro",
+        model: config.gemini.analysisModel,
         contents: [
           {
             role: "user",

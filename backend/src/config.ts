@@ -32,6 +32,7 @@ export const config = {
     videoSlowdownFactor: slowdown,
     analysisFps,
     minConfidence: Number(process.env.GEMINI_MIN_CONFIDENCE ?? 0.80),
+    analysisModel: process.env.GEMINI_ANALYSIS_MODEL ?? "gemini-2.5-pro",
   },
 
   // "gemini" (default, baseline) or "proposer_verifier" (Qwen on Modal proposes, Gemini verifies).
